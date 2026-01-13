@@ -15,15 +15,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Test API Call
+      - name: Test API Call with Streaming
         env:
           FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
           PROMPT: ${{ github.event.inputs.prompt }}
         run: |
-          echo "🚀 Chamando Fireworks AI..."
+          echo "🚀 Chamando Fireworks AI com streaming..."
           
-          # Faz chamada SÍNCRONA
-          RESPONSE=$(curl -s -w "\n%{http_code}" https://api.fireworks.ai/inference/v1/chat/completions \
+          # Faz chamada COM STREAMING
+          RESPONSE=$(curl -s -N https://api.fireworks.ai/inference/v1/chat/completions \
             -H "Authorization: Bearer $FIREWORKS_API_KEY" \
             -H "Content-Type: application/json" \
             -d "{
@@ -39,26 +39,29 @@ jobs:
                   \"role\": \"user\",
                   \"content\": \"$PROMPT\"
                 }
-              ]
-            }")
+              ],
+              \"stream\": true
+            }" | while read -r line; do
+              # Processa cada linha do stream
+              if [[ $line == data:* ]]; then
+                JSON_DATA=${line:6}
+                if [[ "$JSON_DATA" != "[DONE]" ]]; then
+                  # Extrai reasoning_content (Kimi K2 specific)
+                  CONTENT=$(echo "$JSON_DATA" | jq -r '.choices[0].delta.reasoning_content // empty' 2>/dev/null)
+                  if [[ ! -z "$CONTENT" ]]; then
+                    echo -n "$CONTENT"
+                  fi
+                fi
+              fi
+            done)
           
-          # Separa corpo e código HTTP
-          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-          BODY=$(echo "$RESPONSE" | sed '$d')
-          
-          echo "📊 Código HTTP: $HTTP_CODE"
-          echo "📦 Resposta bruta:"
-          echo "$BODY"
-          
-          # Extrai e mostra o resultado
-          RESULT=$(echo "$BODY" | jq -r '.choices[0].message.content // empty')
           echo ""
           echo "✅ RESULTADO FINAL:"
-          echo "$RESULT"
+          echo "$RESPONSE"
           
           # Salva para debug
-          echo "$RESULT" > test-result.txt
+          echo "$RESPONSE" > test-result.txt
           
           # Mostra tamanho
           echo ""
-          echo "📏 Tamanho da resposta: ${#RESULT} caracteres"
+          echo "📏 Tamanho da resposta: ${#RESPONSE} caracteres"
