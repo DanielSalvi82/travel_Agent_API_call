@@ -1,4 +1,4 @@
-name: Fireworks AI Sync Proxy
+name: Fireworks AI Proxy
 
 on:
   repository_dispatch:
@@ -19,58 +19,64 @@ on:
         type: string
 
 jobs:
-  process-sync:
+  process-api:
     runs-on: ubuntu-latest
+    
+    # Permissões necessárias
+    permissions:
+      contents: read
+      actions: write
+    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Call Fireworks AI Synchronously
+      - name: Process Fireworks AI API
         env:
           FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
           PROMPT: ${{ github.event.inputs.prompt || github.event.client_payload.prompt }}
           REQUEST_ID: ${{ github.event.inputs.request_id || github.event.client_payload.request_id }}
           WEBHOOK_URL: ${{ github.event.inputs.webhook_url || github.event.client_payload.webhook_url }}
         run: |
-          # Faz chamada SÍNCRONA (sem streaming)
-          RESPONSE=$(curl -s https://api.fireworks.ai/inference/v1/chat/completions \
+          # Faz chamada com streaming para Fireworks AI
+          RESPONSE=$(curl -s -N https://api.fireworks.ai/inference/v1/chat/completions \
             -H "Authorization: Bearer $FIREWORKS_API_KEY" \
             -H "Content-Type: application/json" \
             -d "{
               \"model\": \"accounts/fireworks/models/kimi-k2-thinking\",
               \"max_tokens\": 16000,
-              \"top_p\": 1,
-              \"top_k\": 40,
-              \"presence_penalty\": 0,
-              \"frequency_penalty\": 0,
-              \"temperature\": 1,
-              \"messages\": [
-                {
-                  \"role\": \"system\",
-                  \"content\": \"${PROMPT}\"
-                }
-              ]
-            }")
+              \"temperature\": 0.7,
+              \"messages\": [{\"role\": \"user\", \"content\": \"$PROMPT\"}],
+              \"stream\": true
+            }" | while read -r line; do
+              if [[ $line == data:* ]]; then
+                JSON_DATA=${line:6}
+                if [[ "$JSON_DATA" != "[DONE]" ]]; then
+                  CONTENT=$(echo "$JSON_DATA" | jq -r '.choices[0].delta.reasoning_content // empty' 2>/dev/null)
+                  if [[ ! -z "$CONTENT" ]]; then
+                    echo -n "$CONTENT"
+                  fi
+                fi
+              fi
+            done)
           
-          # Extrai o content da resposta
-          RESULT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content')
+          echo "Resultado obtido: ${#RESPONSE} caracteres"
           
-          # Salva no repositório (opcional, para histórico)
-          mkdir -p responses
-          echo "$RESULT" > "responses/${REQUEST_ID}.txt"
+          # Salva como artifact (opcional, para debug)
+          echo "$RESPONSE" > "response-${REQUEST_ID}.txt"
           
-          # Commit e push (opcional)
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add "responses/${REQUEST_ID}.txt"
-          git commit -m "Add sync response for $REQUEST_ID" || exit 0
-          git push
-          
-          # ENVIA PARA WEBHOOK DO MAKE.COM
+          # Envia para webhook do Make.com
           curl -X POST "$WEBHOOK_URL" \
             -H "Content-Type: application/json" \
             -d "{
               \"request_id\": \"$REQUEST_ID\",
               \"status\": \"completed\",
-              \"result\": $(echo "$RESULT" | jq -R -s '.')
+              \"result\": $(echo "$RESPONSE" | jq -R -s '.')
             }"
+      
+      - name: Upload artifact (opcional)
+        uses: actions/upload-artifact@v4
+        with:
+          name: response-${{ github.event.inputs.request_id || github.event.client_payload.request_id }}
+          path: response-*.txt
+          retention-days: 1
