@@ -1,0 +1,64 @@
+name: Test Fireworks AI API
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: 'Prompt de teste'
+        required: true
+        default: 'Explique o que é streaming em 10 palavras'
+
+jobs:
+  test-api:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Test API Call
+        env:
+          FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+          PROMPT: ${{ github.event.inputs.prompt }}
+        run: |
+          echo "🚀 Chamando Fireworks AI..."
+          
+          # Faz chamada SÍNCRONA
+          RESPONSE=$(curl -s -w "\n%{http_code}" https://api.fireworks.ai/inference/v1/chat/completions \
+            -H "Authorization: Bearer $FIREWORKS_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"model\": \"accounts/fireworks/models/kimi-k2-thinking\",
+              \"max_tokens\": 16000,
+              \"top_p\": 1,
+              \"top_k\": 40,
+              \"presence_penalty\": 0,
+              \"frequency_penalty\": 0,
+              \"temperature\": 1,
+              \"messages\": [
+                {
+                  \"role\": \"user\",
+                  \"content\": \"$PROMPT\"
+                }
+              ]
+            }")
+          
+          # Separa corpo e código HTTP
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+          
+          echo "📊 Código HTTP: $HTTP_CODE"
+          echo "📦 Resposta bruta:"
+          echo "$BODY"
+          
+          # Extrai e mostra o resultado
+          RESULT=$(echo "$BODY" | jq -r '.choices[0].message.content // empty')
+          echo ""
+          echo "✅ RESULTADO FINAL:"
+          echo "$RESULT"
+          
+          # Salva para debug
+          echo "$RESULT" > test-result.txt
+          
+          # Mostra tamanho
+          echo ""
+          echo "📏 Tamanho da resposta: ${#RESULT} caracteres"
