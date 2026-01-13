@@ -22,23 +22,29 @@ jobs:
   process-api:
     runs-on: ubuntu-latest
     
-    # Permissões necessárias
-    permissions:
-      contents: read
-      actions: write
-    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Process Fireworks AI API
+      - name: Sanitize request_id
+        id: sanitize
+        env:
+          RAW_REQUEST_ID: ${{ github.event.inputs.request_id || github.event.client_payload.request_id }}
+        run: |
+          # Remove caracteres inválidos: :, <, >, |, *, ?, \, /, ", \r, \n
+          SANITIZED_ID=$(echo "$RAW_REQUEST_ID" | sed 's/[:<>|*?\\\/\"\\r\\n]/-/g')
+          echo "sanitized_id=$SANITIZED_ID" >> $GITHUB_OUTPUT
+          echo "Original ID: $RAW_REQUEST_ID"
+          echo "Sanitized ID: $SANITIZED_ID"
+
+      - name: Process Fireworks AI Streaming
         env:
           FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
           PROMPT: ${{ github.event.inputs.prompt || github.event.client_payload.prompt }}
-          REQUEST_ID: ${{ github.event.inputs.request_id || github.event.client_payload.request_id }}
+          REQUEST_ID: ${{ steps.sanitize.outputs.sanitized_id }}
           WEBHOOK_URL: ${{ github.event.inputs.webhook_url || github.event.client_payload.webhook_url }}
         run: |
-          # Faz chamada com streaming para Fireworks AI
+          # Faz chamada com streaming
           RESPONSE=$(curl -s -N https://api.fireworks.ai/inference/v1/chat/completions \
             -H "Authorization: Bearer $FIREWORKS_API_KEY" \
             -H "Content-Type: application/json" \
@@ -62,7 +68,7 @@ jobs:
           
           echo "Resultado obtido: ${#RESPONSE} caracteres"
           
-          # Salva como artifact (opcional, para debug)
+          # Salva como artifact (opcional)
           echo "$RESPONSE" > "response-${REQUEST_ID}.txt"
           
           # Envia para webhook do Make.com
@@ -73,10 +79,10 @@ jobs:
               \"status\": \"completed\",
               \"result\": $(echo "$RESPONSE" | jq -R -s '.')
             }"
-      
+
       - name: Upload artifact (opcional)
         uses: actions/upload-artifact@v4
         with:
-          name: response-${{ github.event.inputs.request_id || github.event.client_payload.request_id }}
+          name: response-${{ steps.sanitize.outputs.sanitized_id }}
           path: response-*.txt
           retention-days: 1
