@@ -1,0 +1,76 @@
+name: Fireworks AI Sync Proxy
+
+on:
+  repository_dispatch:
+    types: [fireworks-request-sync]
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: 'Prompt para o Kimi K2'
+        required: true
+        type: string
+      request_id:
+        description: 'ID único da requisição'
+        required: true
+        type: string
+      webhook_url:
+        description: 'URL do webhook Make.com'
+        required: true
+        type: string
+
+jobs:
+  process-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Call Fireworks AI Synchronously
+        env:
+          FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+          PROMPT: ${{ github.event.inputs.prompt || github.event.client_payload.prompt }}
+          REQUEST_ID: ${{ github.event.inputs.request_id || github.event.client_payload.request_id }}
+          WEBHOOK_URL: ${{ github.event.inputs.webhook_url || github.event.client_payload.webhook_url }}
+        run: |
+          # Faz chamada SÍNCRONA (sem streaming)
+          RESPONSE=$(curl -s https://api.fireworks.ai/inference/v1/chat/completions \
+            -H "Authorization: Bearer $FIREWORKS_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"model\": \"accounts/fireworks/models/kimi-k2-thinking\",
+              \"max_tokens\": 16000,
+              \"top_p\": 1,
+              \"top_k\": 40,
+              \"presence_penalty\": 0,
+              \"frequency_penalty\": 0,
+              \"temperature\": 1,
+              \"messages\": [
+                {
+                  \"role\": \"system\",
+                  \"content\": \"${PROMPT}\"
+                }
+              ]
+            }")
+          
+          # Extrai o content da resposta
+          RESULT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content')
+          
+          # Salva no repositório (opcional, para histórico)
+          mkdir -p responses
+          echo "$RESULT" > "responses/${REQUEST_ID}.txt"
+          
+          # Commit e push (opcional)
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add "responses/${REQUEST_ID}.txt"
+          git commit -m "Add sync response for $REQUEST_ID" || exit 0
+          git push
+          
+          # ENVIA PARA WEBHOOK DO MAKE.COM
+          curl -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"request_id\": \"$REQUEST_ID\",
+              \"status\": \"completed\",
+              \"result\": $(echo "$RESULT" | jq -R -s '.')
+            }"
