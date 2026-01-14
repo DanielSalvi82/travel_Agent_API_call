@@ -40,7 +40,7 @@ jobs:
             -d "{
               \"model\": \"accounts/fireworks/models/kimi-k2-thinking\",
               \"max_tokens\": 16000,
-              \"temperature\": 0.7,
+              \"temperature\": 0.5,
               \"messages\": [{\"role\": \"user\", \"content\": \"$PROMPT\"}],
               \"stream\": true
             }" | while read -r line; do
