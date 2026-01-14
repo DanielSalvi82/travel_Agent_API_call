@@ -37,6 +37,17 @@ jobs:
           RESPONSE=""
           ERROR_MSG=""
 
+          # Monta corpo da requisição com jq -n (escapa prompt longo corretamente)
+          REQUEST_BODY=$(jq -n \
+            --arg prompt "$PROMPT" \
+            '{
+              model: "accounts/fireworks/models/kimi-k2-thinking",
+              max_tokens: 16000,
+              temperature: 0.5,
+              messages: [{role: "user", content: $prompt}],
+              stream: true
+            }')
+
           # Usa process substitution para evitar subshell
           while read -r line; do
             if [[ $line == data:* ]]; then
@@ -68,13 +79,7 @@ jobs:
             curl -s -N https://api.fireworks.ai/inference/v1/chat/completions \
               -H "Authorization: Bearer $FIREWORKS_API_KEY" \
               -H "Content-Type: application/json" \
-              -d "{
-                \"model\": \"accounts/fireworks/models/kimi-k2-thinking\",
-                \"max_tokens\": 16000,
-                \"temperature\": 0.5,
-                \"messages\": [{\"role\": \"user\", \"content\": \"$PROMPT\"}],
-                \"stream\": true
-              }"
+              -d "$REQUEST_BODY"
           )
 
           echo "Análise capturada: ${#ANALYSIS} caracteres"
