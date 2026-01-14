@@ -37,43 +37,45 @@ jobs:
           RESPONSE=""
           ERROR_MSG=""
 
-          # Faz chamada com streaming
-          curl -s -N https://api.fireworks.ai/inference/v1/chat/completions \
-            -H "Authorization: Bearer $FIREWORKS_API_KEY" \
-            -H "Content-Type: application/json" \
-            -d "{
-              \"model\": \"accounts/fireworks/models/kimi-k2-thinking\",
-              \"max_tokens\": 16000,
-              \"temperature\": 0.5,
-              \"messages\": [{\"role\": \"user\", \"content\": \"$PROMPT\"}],
-              \"stream\": true
-            }" | while read -r line; do
-              if [[ $line == data:* ]]; then
-                JSON_DATA=${line:6}
-                if [[ "$JSON_DATA" != "[DONE]" ]]; then
-                  echo "==== Linha recebida ===="
-                  echo "$JSON_DATA" | jq .
+          # Usa process substitution para evitar subshell
+          while read -r line; do
+            if [[ $line == data:* ]]; then
+              JSON_DATA=${line:6}
+              if [[ "$JSON_DATA" != "[DONE]" ]]; then
+                echo "==== Linha recebida ===="
+                echo "$JSON_DATA" | jq .
 
-                  # Captura raciocínio interno
-                  PART_ANALYSIS=$(echo "$JSON_DATA" | jq -r '.choices[0].delta.reasoning_content // empty' 2>/dev/null)
-                  if [[ -n "$PART_ANALYSIS" ]]; then
-                    ANALYSIS+="$PART_ANALYSIS"
-                  fi
+                # Captura raciocínio interno
+                PART_ANALYSIS=$(echo "$JSON_DATA" | jq -r '.choices[0].delta.reasoning_content // empty' 2>/dev/null)
+                if [[ -n "$PART_ANALYSIS" ]]; then
+                  ANALYSIS+="$PART_ANALYSIS"
+                fi
 
-                  # Captura resposta final
-                  PART_RESPONSE=$(echo "$JSON_DATA" | jq -r '.choices[0].delta.content // empty' 2>/dev/null)
-                  if [[ -n "$PART_RESPONSE" ]]; then
-                    RESPONSE+="$PART_RESPONSE"
-                  fi
+                # Captura resposta final
+                PART_RESPONSE=$(echo "$JSON_DATA" | jq -r '.choices[0].delta.content // empty' 2>/dev/null)
+                if [[ -n "$PART_RESPONSE" ]]; then
+                  RESPONSE+="$PART_RESPONSE"
+                fi
 
-                  # Captura erro, se existir
-                  PART_ERROR=$(echo "$JSON_DATA" | jq -r '.error.message // empty' 2>/dev/null)
-                  if [[ -n "$PART_ERROR" ]]; then
-                    ERROR_MSG+="$PART_ERROR"
-                  fi
+                # Captura erro, se existir
+                PART_ERROR=$(echo "$JSON_DATA" | jq -r '.error.message // empty' 2>/dev/null)
+                if [[ -n "$PART_ERROR" ]]; then
+                  ERROR_MSG+="$PART_ERROR"
                 fi
               fi
-            done
+            fi
+          done < <(
+            curl -s -N https://api.fireworks.ai/inference/v1/chat/completions \
+              -H "Authorization: Bearer $FIREWORKS_API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"model\": \"accounts/fireworks/models/kimi-k2-thinking\",
+                \"max_tokens\": 16000,
+                \"temperature\": 0.5,
+                \"messages\": [{\"role\": \"user\", \"content\": \"$PROMPT\"}],
+                \"stream\": true
+              }"
+          )
 
           echo "Análise capturada: ${#ANALYSIS} caracteres"
           echo "Resposta capturada: ${#RESPONSE} caracteres"
