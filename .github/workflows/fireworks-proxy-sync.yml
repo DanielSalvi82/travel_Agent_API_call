@@ -65,7 +65,7 @@ jobs:
             done
 
           echo "Análise capturada: ${#ANALYSIS} caracteres"
-          echo "Resposta capturada: ${#RESPONSE} caracteres"
+          echo "Message: ${#RESPONSE} caracteres"
 
           # Envia para webhook do Make.com com os dois campos
           curl -X POST "$WEBHOOK_URL" \
