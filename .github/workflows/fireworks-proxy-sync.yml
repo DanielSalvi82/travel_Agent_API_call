@@ -36,6 +36,7 @@ jobs:
           ANALYSIS=""
           RESPONSE=""
 
+          # Faz chamada com streaming
           curl -s -N https://api.fireworks.ai/inference/v1/chat/completions \
             -H "Authorization: Bearer $FIREWORKS_API_KEY" \
             -H "Content-Type: application/json" \
@@ -65,14 +66,17 @@ jobs:
             done
 
           echo "Análise capturada: ${#ANALYSIS} caracteres"
-          echo "Message: ${#RESPONSE} caracteres"
+          echo "Resposta capturada: ${#RESPONSE} caracteres"
 
-          # Envia para webhook do Make.com com os dois campos
+          # Monta JSON seguro com jq
+          PAYLOAD=$(jq -n \
+            --arg request_id "$REQUEST_ID" \
+            --arg status "completed" \
+            --arg analysis "$ANALYSIS" \
+            --arg response "$RESPONSE" \
+            '{request_id:$request_id, status:$status, analysis:$analysis, response:$response}')
+
+          # Envia para webhook do Make.com
           curl -X POST "$WEBHOOK_URL" \
             -H "Content-Type: application/json" \
-            -d "{
-              \"request_id\": \"$REQUEST_ID\",
-              \"status\": \"completed\",
-              \"analysis\": $(echo "$ANALYSIS" | jq -R -s '.'),
-              \"message\": $(echo "$RESPONSE" | jq -R -s '.')
-            }"
+            -d "$PAYLOAD"
