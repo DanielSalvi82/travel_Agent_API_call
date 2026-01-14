@@ -74,5 +74,5 @@ jobs:
               \"request_id\": \"$REQUEST_ID\",
               \"status\": \"completed\",
               \"analysis\": $(echo "$ANALYSIS" | jq -R -s '.'),
-              \"response\": $(echo "$RESPONSE" | jq -R -s '.')
+              \"message\": $(echo "$RESPONSE" | jq -R -s '.')
             }"
