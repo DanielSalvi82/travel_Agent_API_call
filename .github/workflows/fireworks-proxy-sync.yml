@@ -35,6 +35,7 @@ jobs:
         run: |
           ANALYSIS=""
           RESPONSE=""
+          ERROR_MSG=""
 
           # Faz chamada com streaming
           curl -s -N https://api.fireworks.ai/inference/v1/chat/completions \
@@ -50,6 +51,9 @@ jobs:
               if [[ $line == data:* ]]; then
                 JSON_DATA=${line:6}
                 if [[ "$JSON_DATA" != "[DONE]" ]]; then
+                  echo "==== Linha recebida ===="
+                  echo "$JSON_DATA" | jq .
+
                   # Captura raciocínio interno
                   PART_ANALYSIS=$(echo "$JSON_DATA" | jq -r '.choices[0].delta.reasoning_content // empty' 2>/dev/null)
                   if [[ -n "$PART_ANALYSIS" ]]; then
@@ -61,12 +65,19 @@ jobs:
                   if [[ -n "$PART_RESPONSE" ]]; then
                     RESPONSE+="$PART_RESPONSE"
                   fi
+
+                  # Captura erro, se existir
+                  PART_ERROR=$(echo "$JSON_DATA" | jq -r '.error.message // empty' 2>/dev/null)
+                  if [[ -n "$PART_ERROR" ]]; then
+                    ERROR_MSG+="$PART_ERROR"
+                  fi
                 fi
               fi
             done
 
           echo "Análise capturada: ${#ANALYSIS} caracteres"
           echo "Resposta capturada: ${#RESPONSE} caracteres"
+          echo "Erro capturado: ${ERROR_MSG}"
 
           # Monta JSON seguro com jq
           PAYLOAD=$(jq -n \
@@ -74,7 +85,8 @@ jobs:
             --arg status "completed" \
             --arg analysis "$ANALYSIS" \
             --arg response "$RESPONSE" \
-            '{request_id:$request_id, status:$status, analysis:$analysis, response:$response}')
+            --arg error "$ERROR_MSG" \
+            '{request_id:$request_id, status:$status, analysis:$analysis, response:$response, error:$error}')
 
           # Envia para webhook do Make.com
           curl -X POST "$WEBHOOK_URL" \
