@@ -1,4 +1,4 @@
-name: Fireworks AI Proxy
+name: Fireworks AI Push Callback
 
 on:
   repository_dispatch:
@@ -6,39 +6,40 @@ on:
   workflow_dispatch:
     inputs:
       prompt:
-        description: 'Prompt para o Kimi K2'
         required: true
         type: string
       request_id:
-        description: 'ID único da requisição'
         required: true
         type: string
       webhook_url:
-        description: 'URL do webhook Make.com'
+        required: true
+        type: string
+      shared_secret:
         required: true
         type: string
 
 jobs:
   process-api:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Process Fireworks AI Streaming
+      - name: Process Fireworks AI Streaming and send callback
         env:
           FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
           PROMPT: ${{ github.event.inputs.prompt || github.event.client_payload.prompt }}
           REQUEST_ID: ${{ github.event.inputs.request_id || github.event.client_payload.request_id }}
           WEBHOOK_URL: ${{ github.event.inputs.webhook_url || github.event.client_payload.webhook_url }}
+          SHARED_SECRET: ${{ github.event.inputs.shared_secret || github.event.client_payload.shared_secret }}
         run: |
           set -euo pipefail
-          ANALYSIS=""
+
           RESPONSE=""
+          ANALYSIS=""
           ERROR_MSG=""
 
-          # Monta corpo da requisição com jq -n (escapa prompt longo corretamente)
+          # Monta corpo da requisição (stream: true)
           REQUEST_BODY=$(jq -n \
             --arg prompt "$PROMPT" \
             '{
@@ -49,25 +50,14 @@ jobs:
               stream: true
             }')
 
-          # Stream: lê linha a linha do curl -s -N
-          # Usamos while-read com process substitution
+          # Stream: concatena chunks preservando quebras de linha
           while read -r line; do
             if [[ $line == data:* ]]; then
               JSON_DATA=${line:6}
               if [[ "$JSON_DATA" != "[DONE]" ]]; then
-                echo "==== Linha recebida ===="
-                echo "$JSON_DATA" | jq . || echo "Não foi possível jq . (linha pode não ser JSON completo)"
-
-                # Captura raciocínio interno
-                PART_ANALYSIS=$(echo "$JSON_DATA" | jq -r '.choices[0].delta.reasoning_content // empty' 2>/dev/null || true)
-                if [[ -n "$PART_ANALYSIS" ]]; then
-                  ANALYSIS+="$PART_ANALYSIS"
-                fi
-
-                # Captura resposta final (preservando quebras de linha)
+                # captura conteúdo incremental
                 PART_RESPONSE=$(echo "$JSON_DATA" | jq -r '.choices[0].delta.content // empty' 2>/dev/null || true)
                 if [[ -n "$PART_RESPONSE" ]]; then
-                  # Se já existe conteúdo em RESPONSE, adiciona uma nova linha antes do próximo chunk
                   if [[ -n "$RESPONSE" ]]; then
                     RESPONSE+=$'\n'"$PART_RESPONSE"
                   else
@@ -75,7 +65,11 @@ jobs:
                   fi
                 fi
 
-                # Captura erro, se existir
+                PART_ANALYSIS=$(echo "$JSON_DATA" | jq -r '.choices[0].delta.reasoning_content // empty' 2>/dev/null || true)
+                if [[ -n "$PART_ANALYSIS" ]]; then
+                  ANALYSIS+="$PART_ANALYSIS"
+                fi
+
                 PART_ERROR=$(echo "$JSON_DATA" | jq -r '.error.message // empty' 2>/dev/null || true)
                 if [[ -n "$PART_ERROR" ]]; then
                   if [[ -n "$ERROR_MSG" ]]; then
@@ -93,31 +87,26 @@ jobs:
               -d "$REQUEST_BODY"
           )
 
-          echo "Análise capturada: ${#ANALYSIS} caracteres"
-          echo "Resposta capturada: ${#RESPONSE} caracteres"
-          echo "Erro capturado: ${ERROR_MSG}"
-
-          # Opcional: trim de espaços em excesso no início/fim
-          # (remove apenas leading/trailing newlines)
+          # Trim leading/trailing newlines
           RESPONSE="$(printf '%s' "$RESPONSE" | sed -e 's/^[[:space:]\n\r]*//' -e 's/[[:space:]\n\r]*$//')"
           ANALYSIS="$(printf '%s' "$ANALYSIS" | sed -e 's/^[[:space:]\n\r]*//' -e 's/[[:space:]\n\r]*$//')"
           ERROR_MSG="$(printf '%s' "$ERROR_MSG" | sed -e 's/^[[:space:]\n\r]*//' -e 's/[[:space:]\n\r]*$//')"
 
-          # Monta JSON seguro com jq
+          # Monta payload com response (Markdown preservado)
           PAYLOAD=$(jq -n \
             --arg request_id "$REQUEST_ID" \
             --arg status "completed" \
-            --arg analysis "$ANALYSIS" \
             --arg response "$RESPONSE" \
+            --arg analysis "$ANALYSIS" \
             --arg error "$ERROR_MSG" \
-            '{request_id:$request_id, status:$status, analysis:$analysis, response:$response, error:$error}')
+            --arg shared_secret "$SHARED_SECRET" \
+            '{request_id:$request_id, status:$status, response:$response, analysis:$analysis, error:$error, shared_secret:$shared_secret, response_markdown:true}')
 
-          # Log do payload (para debug; remova em produção se preferir)
-          echo "Payload a enviar para webhook:"
+          # Log (útil para debug; remova se necessário)
+          echo "Sending callback payload:"
           echo "$PAYLOAD" | jq .
 
-          # Envia para webhook do Make.com
+          # Envia callback para Make
           curl -s -X POST "$WEBHOOK_URL" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD"
-          
