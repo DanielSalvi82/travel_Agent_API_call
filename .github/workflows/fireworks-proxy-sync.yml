@@ -21,7 +21,7 @@ on:
 jobs:
   process-api:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -33,6 +33,7 @@ jobs:
           REQUEST_ID: ${{ github.event.inputs.request_id || github.event.client_payload.request_id }}
           WEBHOOK_URL: ${{ github.event.inputs.webhook_url || github.event.client_payload.webhook_url }}
         run: |
+          set -euo pipefail
           ANALYSIS=""
           RESPONSE=""
           ERROR_MSG=""
@@ -48,30 +49,40 @@ jobs:
               stream: true
             }')
 
-          # Usa process substitution para evitar subshell
+          # Stream: lê linha a linha do curl -s -N
+          # Usamos while-read com process substitution
           while read -r line; do
             if [[ $line == data:* ]]; then
               JSON_DATA=${line:6}
               if [[ "$JSON_DATA" != "[DONE]" ]]; then
                 echo "==== Linha recebida ===="
-                echo "$JSON_DATA" | jq .
+                echo "$JSON_DATA" | jq . || echo "Não foi possível jq . (linha pode não ser JSON completo)"
 
                 # Captura raciocínio interno
-                PART_ANALYSIS=$(echo "$JSON_DATA" | jq -r '.choices[0].delta.reasoning_content // empty' 2>/dev/null)
+                PART_ANALYSIS=$(echo "$JSON_DATA" | jq -r '.choices[0].delta.reasoning_content // empty' 2>/dev/null || true)
                 if [[ -n "$PART_ANALYSIS" ]]; then
                   ANALYSIS+="$PART_ANALYSIS"
                 fi
 
-                # Captura resposta final
-                PART_RESPONSE=$(echo "$JSON_DATA" | jq -r '.choices[0].delta.content // empty' 2>/dev/null)
+                # Captura resposta final (preservando quebras de linha)
+                PART_RESPONSE=$(echo "$JSON_DATA" | jq -r '.choices[0].delta.content // empty' 2>/dev/null || true)
                 if [[ -n "$PART_RESPONSE" ]]; then
-                  RESPONSE+="$PART_RESPONSE"
+                  # Se já existe conteúdo em RESPONSE, adiciona uma nova linha antes do próximo chunk
+                  if [[ -n "$RESPONSE" ]]; then
+                    RESPONSE+=$'\n'"$PART_RESPONSE"
+                  else
+                    RESPONSE="$PART_RESPONSE"
+                  fi
                 fi
 
                 # Captura erro, se existir
-                PART_ERROR=$(echo "$JSON_DATA" | jq -r '.error.message // empty' 2>/dev/null)
+                PART_ERROR=$(echo "$JSON_DATA" | jq -r '.error.message // empty' 2>/dev/null || true)
                 if [[ -n "$PART_ERROR" ]]; then
-                  ERROR_MSG+="$PART_ERROR"
+                  if [[ -n "$ERROR_MSG" ]]; then
+                    ERROR_MSG+=$'\n'"$PART_ERROR"
+                  else
+                    ERROR_MSG="$PART_ERROR"
+                  fi
                 fi
               fi
             fi
@@ -86,6 +97,12 @@ jobs:
           echo "Resposta capturada: ${#RESPONSE} caracteres"
           echo "Erro capturado: ${ERROR_MSG}"
 
+          # Opcional: trim de espaços em excesso no início/fim
+          # (remove apenas leading/trailing newlines)
+          RESPONSE="$(printf '%s' "$RESPONSE" | sed -e 's/^[[:space:]\n\r]*//' -e 's/[[:space:]\n\r]*$//')"
+          ANALYSIS="$(printf '%s' "$ANALYSIS" | sed -e 's/^[[:space:]\n\r]*//' -e 's/[[:space:]\n\r]*$//')"
+          ERROR_MSG="$(printf '%s' "$ERROR_MSG" | sed -e 's/^[[:space:]\n\r]*//' -e 's/[[:space:]\n\r]*$//')"
+
           # Monta JSON seguro com jq
           PAYLOAD=$(jq -n \
             --arg request_id "$REQUEST_ID" \
@@ -95,7 +112,12 @@ jobs:
             --arg error "$ERROR_MSG" \
             '{request_id:$request_id, status:$status, analysis:$analysis, response:$response, error:$error}')
 
+          # Log do payload (para debug; remova em produção se preferir)
+          echo "Payload a enviar para webhook:"
+          echo "$PAYLOAD" | jq .
+
           # Envia para webhook do Make.com
-          curl -X POST "$WEBHOOK_URL" \
+          curl -s -X POST "$WEBHOOK_URL" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD"
+          
