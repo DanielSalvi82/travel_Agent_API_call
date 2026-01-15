@@ -1,4 +1,4 @@
-name: Fireworks AI Push Callback
+name: Fireworks AI Push Callback (complete)
 
 on:
   repository_dispatch:
@@ -22,24 +22,25 @@ jobs:
   process-api:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Process Fireworks AI Streaming and send callback
         env:
           FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+          # Prefer using a secret stored in GitHub; fallback to client_payload if provided
+          SHARED_SECRET: ${{ secrets.SHARED_SECRET || github.event.inputs.shared_secret || github.event.client_payload.shared_secret }}
           PROMPT: ${{ github.event.inputs.prompt || github.event.client_payload.prompt }}
           REQUEST_ID: ${{ github.event.inputs.request_id || github.event.client_payload.request_id }}
           WEBHOOK_URL: ${{ github.event.inputs.webhook_url || github.event.client_payload.webhook_url }}
-          SHARED_SECRET: ${{ github.event.inputs.shared_secret || github.event.client_payload.shared_secret }}
         run: |
           set -euo pipefail
-
+          # Initialize accumulators
           RESPONSE=""
           ANALYSIS=""
           ERROR_MSG=""
 
-          # Monta corpo da requisição (stream: true)
+          # Build request body for streaming call (jq ensures proper escaping)
           REQUEST_BODY=$(jq -n \
             --arg prompt "$PROMPT" \
             '{
@@ -50,12 +51,13 @@ jobs:
               stream: true
             }')
 
-          # Stream: concatena chunks preservando quebras de linha
+          echo "Starting streaming request to Fireworks..."
+          # Stream and concatenate chunks preserving newlines
           while read -r line; do
             if [[ $line == data:* ]]; then
               JSON_DATA=${line:6}
               if [[ "$JSON_DATA" != "[DONE]" ]]; then
-                # captura conteúdo incremental
+                # Try to extract incremental content
                 PART_RESPONSE=$(echo "$JSON_DATA" | jq -r '.choices[0].delta.content // empty' 2>/dev/null || true)
                 if [[ -n "$PART_RESPONSE" ]]; then
                   if [[ -n "$RESPONSE" ]]; then
@@ -65,11 +67,13 @@ jobs:
                   fi
                 fi
 
+                # Capture internal analysis if present
                 PART_ANALYSIS=$(echo "$JSON_DATA" | jq -r '.choices[0].delta.reasoning_content // empty' 2>/dev/null || true)
                 if [[ -n "$PART_ANALYSIS" ]]; then
                   ANALYSIS+="$PART_ANALYSIS"
                 fi
 
+                # Capture any error messages
                 PART_ERROR=$(echo "$JSON_DATA" | jq -r '.error.message // empty' 2>/dev/null || true)
                 if [[ -n "$PART_ERROR" ]]; then
                   if [[ -n "$ERROR_MSG" ]]; then
@@ -87,12 +91,14 @@ jobs:
               -d "$REQUEST_BODY"
           )
 
-          # Trim leading/trailing newlines
+          # Trim leading/trailing whitespace/newlines
           RESPONSE="$(printf '%s' "$RESPONSE" | sed -e 's/^[[:space:]\n\r]*//' -e 's/[[:space:]\n\r]*$//')"
           ANALYSIS="$(printf '%s' "$ANALYSIS" | sed -e 's/^[[:space:]\n\r]*//' -e 's/[[:space:]\n\r]*$//')"
           ERROR_MSG="$(printf '%s' "$ERROR_MSG" | sed -e 's/^[[:space:]\n\r]*//' -e 's/[[:space:]\n\r]*$//')"
 
-          # Monta payload com response (Markdown preservado)
+          echo "Streaming complete. Response length: ${#RESPONSE} chars"
+
+          # Build callback payload (response preserved as Markdown)
           PAYLOAD=$(jq -n \
             --arg request_id "$REQUEST_ID" \
             --arg status "completed" \
@@ -102,11 +108,28 @@ jobs:
             --arg shared_secret "$SHARED_SECRET" \
             '{request_id:$request_id, status:$status, response:$response, analysis:$analysis, error:$error, shared_secret:$shared_secret, response_markdown:true}')
 
-          # Log (útil para debug; remova se necessário)
-          echo "Sending callback payload:"
-          echo "$PAYLOAD" | jq .
+          # Optional: compute HMAC-SHA256 signature of the payload for stronger verification
+          # Signature header format: sha256=<hex>
+          SIG=""
+          if [[ -n "$SHARED_SECRET" ]]; then
+            # Use printf to ensure exact bytes; compute hex digest
+            SIG=$(printf '%s' "$PAYLOAD" | openssl dgst -sha256 -hmac "$SHARED_SECRET" -binary | xxd -p -c 256)
+            SIG="sha256=$SIG"
+          fi
 
-          # Envia callback para Make
-          curl -s -X POST "$WEBHOOK_URL" \
-            -H "Content-Type: application/json" \
-            -d "$PAYLOAD"
+          echo "Callback payload preview (truncated):"
+          echo "$PAYLOAD" | jq '{request_id, status, response_length: (.response|length), error: .error}'
+
+          # Send callback to the provided webhook URL
+          if [[ -n "$SIG" ]]; then
+            curl -s -X POST "$WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -H "X-Signature: $SIG" \
+              -d "$PAYLOAD"
+          else
+            curl -s -X POST "$WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d "$PAYLOAD"
+          fi
+
+          echo "Callback sent to $WEBHOOK_URL"
