@@ -1,4 +1,4 @@
-name: Fireworks proxy sync (streaming + minimal Make callback)
+name: Fireworks proxy sync (streaming + minimal Make callback) - corrigido
 
 permissions:
   contents: write
@@ -261,16 +261,21 @@ jobs:
           git commit -m "Write status for $REQUEST_ID (streaming result)" || echo "no changes"
           git push || echo "git push failed (continuing)"
 
-          # --- Início do bloco: limpeza, extração e envio ao webhook ---
+          # --- Início do bloco corrigido: limpeza, extração e envio ao webhook ---
           raw_response="${RESPONSE:-}"
 
-          # 1) Remover code fences e prefixos comuns (```json, ```)
-          cleaned=$(printf '%s' "$raw_response" | sed -E 's/^```[[:alpha:]]*//; s/```$//; s/^\s+//; s/\s+$//')
+          # 1) Normalizar quebras de linha e remover BOM
+          raw_response=$(printf '%s' "$raw_response" | perl -0777 -pe 's/\r\n?/\n/g; s/^\x{FEFF}//;')
 
-          # 2) Remover prefixos como "json{" -> "{"
-          cleaned=$(printf '%s' "$cleaned" | sed -E 's/^json\s*({)/\1/')
+          # 2) Remover code fences iniciais/ finais (```json, ``` etc.) e prefixos "json{"
+          cleaned=$(printf '%s' "$raw_response" | perl -0777 -pe '
+            s/^\s*```[A-Za-z0-9_-]*\s*\n?//;   # remove fence de abertura
+            s/\n?```\s*$//;                    # remove fence de fechamento
+            s/^\s+//; s/\s+$//;                # trim
+            s/^json\s*({)/$1/;                 # json{...} -> {...}
+          ')
 
-          # 3) Se o texto for JSON, extrair .message quando existir
+          # 3) Tentar parsear JSON e extrair .message com jq; se falhar, usar texto limpo
           message_extracted=""
           if printf '%s' "$cleaned" | jq -e . >/dev/null 2>&1; then
             message_extracted=$(printf '%s' "$cleaned" | jq -r '.message // (. | tostring)' 2>/dev/null || true)
@@ -278,18 +283,21 @@ jobs:
             message_extracted="$cleaned"
           fi
 
-          # 4) Fallback para a resposta bruta se ainda estiver vazio
+          # 4) Fallback para raw_response se ainda vazio
           if [ -z "${message_extracted:-}" ]; then
             message_extracted="$raw_response"
           fi
 
-          # 5) Preparar versões Markdown e HTML simples
+          # 5) Gerar markdown e HTML seguro (escape simples se HTML::Entities não disponível)
           response_text_markdown="$message_extracted"
-          escape_html() {
-            printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
-          }
-          escaped=$(escape_html "$response_text_markdown")
-          response_text_html=$(printf '%s' "$escaped" | sed ':a;N;$!ba;s/\n/<br>/g')
+          # escape básico e preservar quebras de linha como <br>
+          response_text_html=$(printf '%s' "$response_text_markdown" | perl -0777 -pe '
+            s/&/&amp;/g;
+            s/</&lt;/g;
+            s/>/&gt;/g;
+            s/\r\n?/\n/g;
+            s/\n/<br>/g;
+          ')
 
           # 6) Garantir user_id final (prioriza USER_ID_VAR, depois USER_ID_INPUT)
           user_id_final="${USER_ID_VAR:-${USER_ID_INPUT:-}}"
@@ -339,7 +347,7 @@ jobs:
               echo "All webhook attempts failed; last status $HTTP_STATUS. Continuing workflow."
             fi
           fi
-          # --- Fim do bloco ---
+          # --- Fim do bloco corrigido ---
 
           # Optional: Post to Google Sheets (Apps Script) if configured
           if [ -n "${GS_SCRIPT_URL:-}" ]; then
