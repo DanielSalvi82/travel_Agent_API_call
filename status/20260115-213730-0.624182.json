@@ -1,0 +1,69 @@
+{
+  "request_id": "20260115-213730-0.624182",
+  "status": "completed",
+  "createdAt": "2026-01-16T05:37:37Z",
+  "updatedAt": "2026-01-16T05:37:37Z",
+  "poll_at": "2026-01-16T05:37:47Z",
+  "timeout_seconds": 180,
+  "poll_interval": 20,
+  "response": {
+    "text": ""
+  },
+  "InputMessage": "\"InputMessage\": pode planejar 3 dias de viajem no Yosemite?",
+  "ChatHistory": "chat history: Bot Message: \"Hello! I'm Awesome, your professional RV travel planner. I'm ready to architect your perfect road trip adventure.To design personalized itinerary options for you, I'll need a few key details:1. **Trip duration**: How many days do you have?2. **Starting point**: Where will you depart from?3. **Destination**: What's your final destination?4. **Must-see stops**: Any specific places you want to include?5. **Travel dates**: When are you planning to go?If you've already filled out the travel form, just let me know and I'll use that information. Otherwise, share these details and I'll craft exciting, tailored options that match your travel style and preferences!What trip are you dreaming about?\",\nUser Message: \"pode planejar 3 dias de viajem no Yosemite? \",\nItinerary: \"\"\nBot Message: \"Hello! I'm ready to help you plan your next RV adventure. To create personalized itinerary options for you, I'll need some details about your trip.You can either:- **Tell me directly** about your desired destination, dates, group size, and any must-see stops- **Use the travel form** at: https://docs.google.com/forms/d/e/1FAIpQLSeRPjKRa9KYfC8ebRgx9IIdtium5bHRceXbO808H6qLJDXH0A/viewform?usp=header**Key information that helps me craft the best options:**- Trip start/end dates- Departure location and final destination- Any intended stops along the way- Your RV type/specs (length, electrical needs)- Daily driving limit preference- Budget range- Who's traveling (adults, kids, pets)- Your top interests (hiking, food, culture, relaxation, etc.)Once you share these details, I'll present you with 2-3 exciting itinerary options tailored to your style. Where would you like to explore?\",\nUser Message: \"ode planejar 3 dias de viajem em Paso Robles? \",\nItinerary: \"\"\nBot Message: \"placeholder\",\nUser Message: \"pode planejar 3 dias de viajem no Yosemite? \",\nItinerary: \"\"\nBot Message: \"placeholder\",\nUser Message: \"pode me panejar 3 dias em LAke Tahoe, saindo de Burbank \",\nItinerary: \"\"\nBot Message: \"placeholder\",\nUser Message: \"pode me panejar 3 dias em LAke Tahoe, saindo de Burbank \",\nItinerary: \"\"\nBot Message: \"placeholder\",\nUser Message: \"pode me panejar 3 dias em LAke Tahoe, saindo de Burbank \",\nItinerary: \"\"",
+  "TravelerProfile": {
+    "TravelerProfile": {
+      "Pets": "no",
+      "RVType": "Class A motorhome",
+      "userID": "16268642300",
+      "RVSpecs": "2022 Winnebago Vista 29V",
+      "UserAge": "43",
+      "userName": "Daniel Salvi",
+      "groupSize": "2",
+      "ExtraVehicle": "2022 Jeep Wrangler 4D",
+      "RigEnergyInputs": "Lead Acid Batteries, Generator, Solar panels",
+      "RigEnergyAmperage": "50A",
+      "UserCultureCurator": null,
+      "PhysicalLimitations": "None - I can do anything!",
+      "UserPersonaGymFreak": null,
+      "BudgetDailyAllowance": "camping (USD75), entertainment (USD 80), food (USD100)",
+      "MostCommonTypeofTrip": "🧳Longer trips (2-4 weeks)",
+      "dryCampingPreference": "yes , up to 3 days",
+      "MustHavesWhileCamping": "Wi-Fii, Cell Phone Signal, Showers",
+      "RigOptionalSpecsByUser": "battery 100Ah, 150W solar panels, 70 gallons fresh water, 40 gallons grey water, 30 gallons black water, batteries last 10 hours",
+      "UserPersonaDIYTinkerer": null,
+      "UserPersonaPetFriendly": null,
+      "UserPersonaSportsLover": null,
+      "UserPersonaScenicSeeker": "1",
+      "UserPersonaContetCreator": "4",
+      "UserPersonaFamilyFocused": null,
+      "UserPersonaSlowTraveller": null,
+      "groupSizeChildrenAndAges": "no",
+      "UserPersonaFoodieExplorer": "3",
+      "UserPersonaAdventureChaser": "2",
+      "UserPersonaOffGridWanderer": null,
+      "UserPersonaRelaxationNomad": null,
+      "UserPersonaSocialConnector": null,
+      "UserPersonaSpiritualSeeker": "5",
+      "BudgetTravellingPreferences": "Low budget options for both camping/parking and activities.",
+      "UserPersonaConvenienceSeeker": null,
+      "UserPersonaPrepperSuvivalist": null,
+      "AdditionalInformedRestriction": null,
+      "UserPersonaBucketListCollector": "6"
+    }
+  },
+  "TravelInputs": {
+    "Travel_Inputs": {
+      "userID": "16268642300",
+      "RoundTrip": "No",
+      "TripEndDate": "6/10/2026 18:00:00",
+      "TripStartDate": "5/27/2026 8:00:00",
+      "IntendedTypeOfCampSites": "Full Hook-ups",
+      "MinimumNumberofNightsPerStop": "No minimum amount of nights",
+      "PlaceOfDepartureAtStartOfTrip": "Burbank, California",
+      "FinalDestinationAndIntendedStops": "BigSur, Carmel, Yosemite National Park, Mammoth Lakes, Lake Tahoe, San Francisco",
+      "MaximumDrivingDistanceOrDurationPerDay": "5 hours maximum"
+    }
+  },
+  "user_id": "16268642300"
+}
