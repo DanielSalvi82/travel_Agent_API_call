@@ -1,4 +1,4 @@
-name: Fireworks AI Proxy (streaming, fixed formatting)
+name: Fireworks AI Proxy (streaming, ordered payload for kimi)
 
 on:
   repository_dispatch:
@@ -17,6 +17,13 @@ on:
         description: 'URL do webhook Make.com'
         required: true
         type: string
+      needs_polling:
+        description: 'true or false (se deve criar status file e notificar)'
+        required: false
+        default: 'true'
+
+permissions:
+  contents: write
 
 jobs:
   process-api:
@@ -26,100 +33,129 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Process Fireworks AI Streaming (fixed formatting)
+      - name: Process Fireworks AI Streaming (ordered payload for Kimi)
         env:
           FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
-          PROMPT: ${{ github.event.inputs.prompt || github.event.client_payload.prompt }}
+          PROMPT_INPUT: ${{ github.event.inputs.prompt || github.event.client_payload.prompt }}
           REQUEST_ID: ${{ github.event.inputs.request_id || github.event.client_payload.request_id }}
           WEBHOOK_URL: ${{ github.event.inputs.webhook_url || github.event.client_payload.webhook_url }}
+          NEEDS_POLLING: ${{ github.event.inputs.needs_polling || github.event.client_payload.needs_polling || 'true' }}
         run: |
           set -euo pipefail
 
+          # Accumulators and debug files
           ANALYSIS=""
           RESPONSE=""
           ERROR_MSG=""
-
-          # Temp files for raw stream and curl stderr (for debugging)
           RAW_STREAM_FILE=$(mktemp)
           CURL_ERR_FILE=$(mktemp)
 
-          # Build request body safely with jq -n (escapes prompt)
-          REQUEST_BODY=$(jq -n --arg prompt "$PROMPT" '{
+          # Try to extract structured inputs from client_payload if present
+          EVENT_PATH="${GITHUB_EVENT_PATH:-}"
+          INPUT_MESSAGE_RAW=""
+          PROMPT_RAW=""
+          CHATHISTORY_RAW=""
+          TRAVELER_PROFILE_RAW=""
+          TRAVEL_INPUTS_RAW=""
+          USER_ID_RAW=""
+
+          if [ -n "${EVENT_PATH}" ] && [ -f "${EVENT_PATH}" ]; then
+            INPUT_MESSAGE_RAW=$(jq -c -r '.client_payload.input_message // .client_payload.InputMessage // .inputs.input_message // empty' "$EVENT_PATH" 2>/dev/null || true)
+            PROMPT_RAW=$(jq -c -r '.client_payload.prompt // .inputs.prompt // empty' "$EVENT_PATH" 2>/dev/null || true)
+            CHATHISTORY_RAW=$(jq -c -r '.client_payload.chathistory // .client_payload.ChatHistory // .inputs.chathistory // empty' "$EVENT_PATH" 2>/dev/null || true)
+            TRAVELER_PROFILE_RAW=$(jq -c -r '.client_payload.traveler_profile // .client_payload.TravelerProfile // .inputs.traveler_profile // empty' "$EVENT_PATH" 2>/dev/null || true)
+            TRAVEL_INPUTS_RAW=$(jq -c -r '.client_payload.travel_inputs // .client_payload.TravelInputs // .inputs.travel_inputs // empty' "$EVENT_PATH" 2>/dev/null || true)
+            USER_ID_RAW=$(jq -r '.client_payload.user_id // .client_payload.userID // .inputs.user_id // empty' "$EVENT_PATH" 2>/dev/null || true)
+          fi
+
+          # Fallbacks: if not present in client_payload, use PROMPT_INPUT for prompt
+          if [ -z "$PROMPT_RAW" ] && [ -n "${PROMPT_INPUT:-}" ]; then
+            PROMPT_RAW="$PROMPT_INPUT"
+          fi
+
+          # Helper: convert raw to JSON or JSON-string for jq --argjson usage
+          to_json_or_null() {
+            local raw="$1"
+            if [ -z "$raw" ]; then
+              printf 'null'
+            else
+              if printf '%s' "$raw" | jq -e . >/dev/null 2>&1; then
+                printf '%s' "$raw"
+              else
+                printf '%s' "$(jq -Rn --arg s "$raw" '$s')"
+              fi
+            fi
+          }
+
+          INPUT_MESSAGE_JSON=$(to_json_or_null "$INPUT_MESSAGE_RAW")
+          PROMPT_JSON=$(to_json_or_null "$PROMPT_RAW")
+          CHATHISTORY_JSON=$(to_json_or_null "$CHATHISTORY_RAW")
+          TRAVELER_PROFILE_JSON=$(to_json_or_null "$TRAVELER_PROFILE_RAW")
+          TRAVEL_INPUTS_JSON=$(to_json_or_null "$TRAVEL_INPUTS_RAW")
+          USER_ID_JSON=$(to_json_or_null "$USER_ID_RAW")
+
+          # --- BUILD ORDERED PAYLOAD FOR KIMI (exact order preserved) ---
+          # The 'input' field contains the ordered object required by the model.
+          PAYLOAD_SCENARIO1=$(jq -n \
+            --argjson input_message "$INPUT_MESSAGE_JSON" \
+            --argjson prompt "$PROMPT_JSON" \
+            --argjson chathistory "$CHATHISTORY_JSON" \
+            --argjson traveler_profile "$TRAVELER_PROFILE_JSON" \
+            --argjson travel_inputs "$TRAVEL_INPUTS_JSON" \
+            --argjson user_id "$USER_ID_JSON" \
+            '{
+              input_message: $input_message,
+              prompt: $prompt,
+              chathistory: $chathistory,
+              traveler_profile: $traveler_profile,
+              travel_inputs: $travel_inputs,
+              user_id: $user_id
+            }'
+          )
+
+          echo "=== PAYLOAD_SCENARIO1 (ordered) ==="
+          echo "$PAYLOAD_SCENARIO1" | jq .
+
+          # Build request body for Kimi model using 'input' with ordered payload
+          REQUEST_BODY=$(jq -n --argjson ordered_input "$PAYLOAD_SCENARIO1" '{
             model: "accounts/fireworks/models/kimi-k2-thinking",
             max_tokens: 16000,
             temperature: 0.5,
-            messages: [{role: "user", content: $prompt}],
+            input: $ordered_input,
             stream: true
           }')
 
-          echo "=== REQUEST_BODY (preview) ==="
-          printf '%s\n' "$REQUEST_BODY" | head -c 2000 || true
-          echo "=============================="
+          echo "Calling Fireworks (stream=true) with ordered input..."
 
-          # Helper: append fragment to RESPONSE with smart spacing
+          # Helpers to append fragments with smart spacing (keeps formatting)
           append_response() {
             local frag="$1"
-            # trim leading/trailing whitespace/newlines
             frag="$(printf '%s' "$frag" | sed -e 's/^[[:space:]\n\r]*//' -e 's/[[:space:]\n\r]*$//')"
-            if [ -z "$frag" ]; then
-              return
-            fi
-            # If RESPONSE empty, set directly
-            if [ -z "$RESPONSE" ]; then
-              RESPONSE="$frag"
-              return
-            fi
-            # If fragment starts with punctuation that should attach to previous token, append directly
-            if printf '%s' "$frag" | grep -qE '^[\.\,\!\?\:\;\)\]\}]'; then
-              RESPONSE+="$frag"
-              return
-            fi
-            # If RESPONSE ends with opening punctuation or whitespace, append without extra space
-            if printf '%s' "$RESPONSE" | grep -qE '[[:space:]]$|[\(\[\{]$'; then
-              RESPONSE+="$frag"
-              return
-            fi
-            # Default: add single space then fragment
+            if [ -z "$frag" ]; then return; fi
+            if [ -z "$RESPONSE" ]; then RESPONSE="$frag"; return; fi
+            if printf '%s' "$frag" | grep -qE '^[\.\,\!\?\:\;\)\]\}]'; then RESPONSE+="$frag"; return; fi
+            if printf '%s' "$RESPONSE" | grep -qE '[[:space:]]$|[\(\[\{]$'; then RESPONSE+="$frag"; return; fi
             RESPONSE+=" $frag"
           }
 
-          # Helper: append reasoning fragments with sensible spacing
           append_reasoning() {
             local frag="$1"
             frag="$(printf '%s' "$frag" | sed -e 's/^[[:space:]\n\r]*//' -e 's/[[:space:]\n\r]*$//')"
-            if [ -z "$frag" ]; then
-              return
-            fi
-            if [ -z "$ANALYSIS" ]; then
-              ANALYSIS="$frag"
-            else
-              # separate reasoning fragments with a single space
-              ANALYSIS+=" $frag"
-            fi
+            if [ -z "$frag" ]; then return; fi
+            if [ -z "$ANALYSIS" ]; then ANALYSIS="$frag"; else ANALYSIS+=" $frag"; fi
           }
 
-          echo "STREAM: starting curl (process substitution) — will block until stream ends or connection closes"
+          # Streaming loop using process substitution so variables persist
           LINE_NO=0
           DELTA_COUNT=0
           REASONING_COUNT=0
 
-          # Use process substitution so variables persist after loop
           while IFS= read -r line; do
             LINE_NO=$((LINE_NO+1))
-            TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-            # Save raw line for later inspection
+            # Save raw line
             printf '%s\n' "$line" >> "$RAW_STREAM_FILE"
 
-            # Short log per line
-            echo "STREAM LINE $LINE_NO @ $TIMESTAMP"
-            if printf '%s' "$line" | jq . >/dev/null 2>&1; then
-              printf '%s\n' "$line" | jq . || true
-            else
-              echo "$line"
-            fi
-
-            # Handle SSE "data:" prefix and ignore [DONE]
+            # Handle SSE "data:" prefix
             if [[ $line == data:* ]]; then
               JSON_DATA="${line#data:}"
               JSON_DATA="${JSON_DATA# }"
@@ -127,47 +163,38 @@ jobs:
               JSON_DATA="$line"
             fi
 
-            # Skip empty or DONE markers
+            # Skip empty or DONE
             if [[ -z "$JSON_DATA" ]] || [[ "$JSON_DATA" == "[DONE]" ]]; then
-              echo "STREAM: skipped empty or [DONE] marker"
               continue
             fi
 
-            # Extract reasoning fragment (delta.reasoning_content)
+            # Extract reasoning fragment
             PART_ANALYSIS=$(printf '%s' "$JSON_DATA" | jq -r '.choices? // [] | .[] | .delta? // {} | .reasoning_content? // empty' 2>/dev/null || true)
             if [[ -n "$PART_ANALYSIS" ]]; then
               REASONING_COUNT=$((REASONING_COUNT+1))
               append_reasoning "$PART_ANALYSIS"
-              echo "STREAM: captured reasoning fragment (len=${#PART_ANALYSIS})"
             fi
 
-            # Extract content fragment (delta.content)
+            # Extract content fragment
             PART_RESPONSE=$(printf '%s' "$JSON_DATA" | jq -r '.choices? // [] | .[] | .delta? // {} | .content? // empty' 2>/dev/null || true)
             if [[ -n "$PART_RESPONSE" ]]; then
               DELTA_COUNT=$((DELTA_COUNT+1))
               append_response "$PART_RESPONSE"
-              echo "STREAM: captured content fragment (len=${#PART_RESPONSE})"
             fi
 
-            # Also capture full message objects (non-delta)
+            # Full message fallback
             FULL_MSG=$(printf '%s' "$JSON_DATA" | jq -r '.choices? // [] | .[] | .message? // empty' 2>/dev/null || true)
             if [[ -n "$FULL_MSG" && "$FULL_MSG" != "null" ]]; then
               MSG_CONTENT=$(printf '%s' "$FULL_MSG" | jq -r '.content // empty' 2>/dev/null || true)
               if [[ -n "$MSG_CONTENT" ]]; then
                 append_response "$MSG_CONTENT"
-                echo "STREAM: captured full message content (len=${#MSG_CONTENT})"
               fi
             fi
 
             # Capture error if present
             PART_ERROR=$(printf '%s' "$JSON_DATA" | jq -r '.error.message // empty' 2>/dev/null || true)
             if [[ -n "$PART_ERROR" ]]; then
-              if [[ -n "$ERROR_MSG" ]]; then
-                ERROR_MSG+=$'\n'"$PART_ERROR"
-              else
-                ERROR_MSG="$PART_ERROR"
-              fi
-              echo "STREAM: captured error fragment: $PART_ERROR"
+              if [[ -n "$ERROR_MSG" ]]; then ERROR_MSG+=$'\n'"$PART_ERROR"; else ERROR_MSG="$PART_ERROR"; fi
             fi
 
           done < <(
@@ -178,14 +205,14 @@ jobs:
               -d "$REQUEST_BODY" 2> "$CURL_ERR_FILE"
           )
 
-          # After stream ends, show curl stderr if any
+          # Show curl stderr if any
           if [ -s "$CURL_ERR_FILE" ]; then
             echo "CURL STDERR (preview):"
             head -c 2000 "$CURL_ERR_FILE" || true
           fi
 
           echo "STREAM finished. Lines received: $LINE_NO, content fragments: $DELTA_COUNT, reasoning fragments: $REASONING_COUNT"
-          echo "Raw stream file preview (first 2000 chars):"
+          echo "Raw stream preview (first 2000 chars):"
           head -c 2000 "$RAW_STREAM_FILE" || true
           echo
 
@@ -198,36 +225,48 @@ jobs:
           echo "Resposta capturada: ${#RESPONSE} caracteres"
           echo "Erro capturado: ${ERROR_MSG:-<none>}"
 
-          # If RESPONSE empty, explicit fallback
           if [ -z "${RESPONSE// }" ]; then
             RESPONSE="__NO_RESPONSE_FROM_MODEL__"
             echo "WARN: response empty after parsing -> using fallback marker"
           fi
 
-          # Build minimal payload for webhook
+          # Build minimal status payload (ordered fields already used for model input)
           MINIMAL_PAYLOAD=$(jq -n \
             --arg rid "$REQUEST_ID" \
             --arg status "completed" \
             --arg response_text "$RESPONSE" \
             --arg reasoning_text "$ANALYSIS" \
             --arg error_text "$ERROR_MSG" \
-            --arg user_id "" \
+            --arg user_id "$USER_ID_RAW" \
             '{request_id: $rid, status: $status, response: { text: $response_text }, reasoning: $reasoning_text, error: $error_text, user_id: $user_id}')
 
           echo "Payload a enviar para webhook (preview):"
           echo "$MINIMAL_PAYLOAD" | jq .
 
-          # Send to webhook (Make.com)
-          if [ -n "${WEBHOOK_URL:-}" ]; then
-            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$WEBHOOK_URL" \
-              -H "Content-Type: application/json" \
-              --data-binary "$MINIMAL_PAYLOAD" || echo "000")
-            echo "Webhook notify -> HTTP $HTTP_STATUS"
+          # Write status file and notify webhook if requested
+          if [[ "${NEEDS_POLLING}" == "true" ]]; then
+            mkdir -p status
+            echo "$MINIMAL_PAYLOAD" > status/$REQUEST_ID.json
+
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add status/$REQUEST_ID.json
+            git commit -m "Write minimal status for $REQUEST_ID" || echo "no changes to commit"
+            git push || echo "git push failed (continuing)"
+
+            if [ -n "${WEBHOOK_URL:-}" ]; then
+              HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$WEBHOOK_URL" \
+                -H "Content-Type: application/json" \
+                --data-binary "$MINIMAL_PAYLOAD" || echo "000")
+              echo "Webhook notify -> HTTP $HTTP_STATUS"
+            else
+              echo "No WEBHOOK_URL provided; skipping notify."
+            fi
           else
-            echo "No WEBHOOK_URL provided; skipping notify."
+            echo "NEEDS_POLLING != true -> skipping status file creation and webhook notify."
           fi
 
-          # Clean up temp files
+          # Cleanup
           rm -f "$RAW_STREAM_FILE" "$CURL_ERR_FILE" || true
 
           echo "Done processing request_id=$REQUEST_ID"
