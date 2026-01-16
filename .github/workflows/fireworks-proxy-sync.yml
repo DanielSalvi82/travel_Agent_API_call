@@ -1,4 +1,4 @@
-name: Fireworks proxy sync (streaming + conditional polling webhook)
+name: Fireworks proxy (ordered payload, streaming + sync, conditional status + webhook)
 
 permissions:
   contents: write
@@ -35,6 +35,9 @@ jobs:
       - name: Read client_payload (extract fields)
         id: read
         run: |
+          set -euo pipefail
+
+          # Read raw event payload (supports workflow_dispatch and repository_dispatch)
           PROMPT_RAW=$(jq -c -r '.client_payload.prompt // .inputs.prompt // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || true)
           REQUEST_ID=$(jq -r '.client_payload.request_id // .inputs.request_id // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || true)
           WEBHOOK_URL=$(jq -r '.client_payload.webhook_url // .inputs.webhook_url // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || true)
@@ -46,6 +49,7 @@ jobs:
           TRAVEL_INPUTS=$(jq -c -r '.client_payload.travel_inputs // .client_payload.TravelInputs // .inputs.travel_inputs // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || true)
           USER_ID_INPUT=$(jq -r '.client_payload.user_id // .client_payload.userID // .inputs.user_id // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || true)
 
+          # Export outputs
           echo "prompt_raw<<EOF" >> $GITHUB_OUTPUT
           echo "$PROMPT_RAW" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
@@ -71,186 +75,204 @@ jobs:
 
           echo "user_id_input=$USER_ID_INPUT" >> $GITHUB_OUTPUT
 
-      - name: Process Fireworks AI Streaming and persist results (conditional polling)
+      - name: Call Fireworks model (ordered payload, streaming + sync)
+        id: call_fireworks
         env:
           FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
-          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}        # opcional: se definido, adiciona X-Hub-Signature-256
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}        # optional: used when sending webhook back
           PROMPT_RAW: ${{ steps.read.outputs.prompt_raw }}
           REQUEST_ID: ${{ steps.read.outputs.request_id }}
-          WEBHOOK_URL: ${{ steps.read.outputs.webhook_url }}
           NEEDS_POLLING: ${{ steps.read.outputs.needs_polling }}
           INPUT_MESSAGE_RAW: ${{ steps.read.outputs.input_message }}
           CHAT_HISTORY_RAW: ${{ steps.read.outputs.chathistory }}
           TRAVELER_PROFILE_RAW: ${{ steps.read.outputs.traveler_profile }}
           TRAVEL_INPUTS_RAW: ${{ steps.read.outputs.travel_inputs }}
-          USER_ID_INPUT: ${{ steps.read.outputs.user_id_input }}
-          GS_SCRIPT_URL: ${{ secrets.GS_SCRIPT_URL }}
-          GS_SCRIPT_KEY: ${{ secrets.GS_SCRIPT_KEY }}
+          USER_ID_VAR: ${{ steps.read.outputs.user_id_input }}
         run: |
           set -euo pipefail
-
-          ANALYSIS=""
-          RESPONSE=""
-          ERROR_MSG=""
-
-          # Monta request body para Fireworks (stream=true)
-          IS_JSON=$(printf '%s' "$PROMPT_RAW" | jq -e . >/dev/null 2>&1 && echo "true" || echo "false")
-          if [ "$IS_JSON" = "true" ]; then
-            TYPE=$(printf '%s' "$PROMPT_RAW" | jq -r 'type' 2>/dev/null || echo "string")
-            if [ "$TYPE" = "array" ]; then
-              REQUEST_BODY=$(jq -n --argjson msgs "$PROMPT_RAW" '{
-                model: "accounts/fireworks/models/kimi-k2-thinking",
-                max_tokens: 16000,
-                temperature: 0.5,
-                messages: $msgs,
-                stream: true
-              }')
+          # Convert empty strings to null for jq --argjson usage
+          to_json_or_null() {
+            local raw="$1"
+            if [ -z "$raw" ]; then
+              printf 'null'
             else
-              HAS_MESSAGES=$(printf '%s' "$PROMPT_RAW" | jq 'has("messages")' 2>/dev/null || echo "false")
-              if [ "$HAS_MESSAGES" = "true" ]; then
-                REQUEST_BODY=$(jq -n --argjson obj "$PROMPT_RAW" '{
-                  model: "accounts/fireworks/models/kimi-k2-thinking",
-                  max_tokens: 16000,
-                  temperature: 0.5,
-                  messages: $obj.messages,
-                  stream: true
-                }')
+              # try to parse as JSON; if fails, treat as string
+              if printf '%s' "$raw" | jq -e . >/dev/null 2>&1; then
+                printf '%s' "$raw"
               else
-                REQUEST_BODY=$(jq -n --argjson obj "$PROMPT_RAW" '{
-                  model: "accounts/fireworks/models/kimi-k2-thinking",
-                  max_tokens: 16000,
-                  temperature: 0.5,
-                  messages: [{role:"system", content: ($obj|tostring)}],
-                  stream: true
-                }')
+                # escape as JSON string
+                printf '%s' "$(jq -Rn --arg s "$raw" '$s')"
               fi
             fi
-          else
-            REQUEST_BODY=$(jq -n --arg prompt "$PROMPT_RAW" '{
+          }
+
+          INPUT_MESSAGE_JSON=$(to_json_or_null "$INPUT_MESSAGE_RAW")
+          PROMPT_JSON=$(to_json_or_null "$PROMPT_RAW")
+          CHATHISTORY_JSON=$(to_json_or_null "$CHAT_HISTORY_RAW")
+          TRAVELER_PROFILE_JSON=$(to_json_or_null "$TRAVELER_PROFILE_RAW")
+          TRAVEL_INPUTS_JSON=$(to_json_or_null "$TRAVEL_INPUTS_RAW")
+
+          # Build ordered payload for scenario 1 (explicit order)
+          PAYLOAD_SCENARIO1=$(jq -n \
+            --argjson input_message "$INPUT_MESSAGE_JSON" \
+            --argjson prompt "$PROMPT_JSON" \
+            --argjson chathistory "$CHATHISTORY_JSON" \
+            --argjson traveler_profile "$TRAVELER_PROFILE_JSON" \
+            --argjson travel_inputs "$TRAVEL_INPUTS_JSON" \
+            '{
+              input_message: $input_message,
+              prompt: $prompt,
+              chathistory: $chathistory,
+              traveler_profile: $traveler_profile,
+              travel_inputs: $travel_inputs
+            }'
+          )
+
+          echo "=== PAYLOAD_SCENARIO1 (ordered) ==="
+          echo "$PAYLOAD_SCENARIO1" | jq .
+
+          # Prepare request body for Fireworks model
+          # Use field "input" containing the ordered payload
+          if [[ "${NEEDS_POLLING}" == "true" ]]; then
+            REQUEST_BODY=$(jq -n --argjson ordered_input "$PAYLOAD_SCENARIO1" '{
               model: "accounts/fireworks/models/kimi-k2-thinking",
               max_tokens: 16000,
               temperature: 0.5,
-              messages: [{role: "user", content: $prompt}],
+              input: $ordered_input,
               stream: true
+            }')
+          else
+            REQUEST_BODY=$(jq -n --argjson ordered_input "$PAYLOAD_SCENARIO1" '{
+              model: "accounts/fireworks/models/kimi-k2-thinking",
+              max_tokens: 16000,
+              temperature: 0.5,
+              input: $ordered_input,
+              stream: false
             }')
           fi
 
-          echo "Starting streaming request to Fireworks (request_id=$REQUEST_ID)..."
-          echo "Request body size: $(printf '%s' "$REQUEST_BODY" | wc -c) bytes"
+          echo "Calling Fireworks API (stream=${NEEDS_POLLING})..."
 
-          # Stream: acumula partes de analysis e response
-          while IFS= read -r line; do
-            if [[ $line == data:* ]]; then
-              JSON_DATA="${line#data:}"
-              JSON_TRIM=$(printf '%s' "$JSON_DATA" | tr -d '\r\n')
-              if [[ "$JSON_TRIM" == "[DONE]" ]]; then
-                echo "Stream finished ([DONE])"
-                break
-              fi
-              if [[ -n "$JSON_TRIM" ]]; then
-                PART_ANALYSIS=$(printf '%s' "$JSON_TRIM" | jq -r '.choices[0].delta.reasoning_content // empty' 2>/dev/null || true)
-                if [[ -n "$PART_ANALYSIS" ]]; then
-                  ANALYSIS+="$PART_ANALYSIS"
+          MESSAGE_EXTRACTED=""
+          ANALYSIS=""
+          ERROR_MSG=""
+
+          if [[ "${NEEDS_POLLING}" == "true" ]]; then
+            # Streaming call: accumulate response pieces
+            while IFS= read -r line; do
+              if [[ $line == data:* ]]; then
+                JSON_DATA="${line#data:}"
+                JSON_TRIM=$(printf '%s' "$JSON_DATA" | tr -d '\r\n')
+                if [[ "$JSON_TRIM" == "[DONE]" ]]; then
+                  break
                 fi
+                if [[ -n "$JSON_TRIM" ]]; then
+                  PART_ANALYSIS=$(printf '%s' "$JSON_TRIM" | jq -r '.choices[0].delta.reasoning_content // empty' 2>/dev/null || true)
+                  if [[ -n "$PART_ANALYSIS" ]]; then ANALYSIS+="$PART_ANALYSIS"; fi
 
-                PART_RESPONSE=$(printf '%s' "$JSON_TRIM" | jq -r '.choices[0].delta.content // empty' 2>/dev/null || true)
-                if [[ -n "$PART_RESPONSE" ]]; then
-                  RESPONSE+="$PART_RESPONSE"
-                fi
+                  PART_RESPONSE=$(printf '%s' "$JSON_TRIM" | jq -r '.choices[0].delta.content // empty' 2>/dev/null || true)
+                  if [[ -n "$PART_RESPONSE" ]]; then RESPONSE+="$PART_RESPONSE"; fi
 
-                PART_ERROR=$(printf '%s' "$JSON_TRIM" | jq -r '.error.message // empty' 2>/dev/null || true)
-                if [[ -n "$PART_ERROR" ]]; then
-                  ERROR_MSG+="$PART_ERROR"
+                  PART_ERROR=$(printf '%s' "$JSON_TRIM" | jq -r '.error.message // empty' 2>/dev/null || true)
+                  if [[ -n "$PART_ERROR" ]]; then ERROR_MSG+="$PART_ERROR"; fi
                 fi
               fi
+            done < <(
+              curl -s -N https://api.fireworks.ai/inference/v1/chat/completions \
+                -H "Authorization: Bearer $FIREWORKS_API_KEY" \
+                -H "Content-Type: application/json" \
+                -d "$REQUEST_BODY"
+            )
+
+            # Final best-effort extraction
+            MESSAGE_EXTRACTED="${RESPONSE:-$ANALYSIS}"
+            if [ -z "$MESSAGE_EXTRACTED" ]; then
+              MESSAGE_EXTRACTED="$ERROR_MSG"
             fi
-          done < <(
-            curl -s -N https://api.fireworks.ai/inference/v1/chat/completions \
+
+          else
+            # Synchronous call: get full JSON response
+            SYNC_RAW=$(curl -s -X POST https://api.fireworks.ai/inference/v1/chat/completions \
               -H "Authorization: Bearer $FIREWORKS_API_KEY" \
               -H "Content-Type: application/json" \
-              -d "$REQUEST_BODY"
-          )
+              -d "$REQUEST_BODY" || true)
 
-          echo "Streaming complete. Analysis length: ${#ANALYSIS}, Response length: ${#RESPONSE}"
-          echo "Any errors captured: ${ERROR_MSG:-<none>}"
+            # Try to pretty-print and extract best fields
+            echo "Fireworks sync raw response:"
+            echo "$SYNC_RAW" | jq . || echo "$SYNC_RAW"
 
-          # Inputs e fallback
-          INPUT_MSG="${INPUT_MESSAGE_RAW:-$PROMPT_RAW}"
-          CHAT_HISTORY="${CHAT_HISTORY_RAW:-[]}"
-          TRAVELER_PROFILE="${TRAVELER_PROFILE_RAW:-{}}"
-          TRAVEL_INPUTS="${TRAVEL_INPUTS_RAW:-{}}"
-          USER_ID_VAR="${USER_ID_INPUT:-}"
+            # Try multiple extraction strategies
+            MESSAGE_EXTRACTED=$(printf '%s' "$SYNC_RAW" | jq -r '.choices[0].message.content // .choices[0].message // .response_text // .response.text // empty' 2>/dev/null || true)
+            if [ -z "$MESSAGE_EXTRACTED" ]; then
+              # fallback to entire response
+              MESSAGE_EXTRACTED="$SYNC_RAW"
+            fi
+          fi
+
+          # Export message_extracted for later steps
+          echo "message_extracted<<EOF" >> $GITHUB_OUTPUT
+          echo "$MESSAGE_EXTRACTED" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          # Also expose the ordered payload for debugging or downstream use
+          echo "payload_scenario1<<EOF" >> $GITHUB_OUTPUT
+          echo "$PAYLOAD_SCENARIO1" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create status file and notify webhook (conditional on NEEDS_POLLING)
+        env:
+          REQUEST_ID: ${{ steps.read.outputs.request_id }}
+          NEEDS_POLLING: ${{ steps.read.outputs.needs_polling }}
+          WEBHOOK_URL: ${{ steps.read.outputs.webhook_url }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          MESSAGE_EXTRACTED: ${{ steps.call_fireworks.outputs.message_extracted }}
+          INPUT_MESSAGE_RAW: ${{ steps.read.outputs.input_message }}
+          CHAT_HISTORY_RAW: ${{ steps.read.outputs.chathistory }}
+          TRAVELER_PROFILE_RAW: ${{ steps.read.outputs.traveler_profile }}
+          TRAVEL_INPUTS_RAW: ${{ steps.read.outputs.travel_inputs }}
+          USER_ID_VAR: ${{ steps.read.outputs.user_id_input }}
+        run: |
+          set -euo pipefail
 
           NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          POLL_AT=$(date -u -d "+30 seconds" +"%Y-%m-%dT%H:%M:%SZ")
+          POLL_AT=$(date -u -d "+10 seconds" +"%Y-%m-%dT%H:%M:%SZ" || date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-          # Preparar STATUS_JSON (usado apenas se NEEDS_POLLING == "true")
+          # Build status JSON (useful for polling clients)
           STATUS_JSON=$(jq -n \
             --arg rid "$REQUEST_ID" \
             --arg status "completed" \
             --arg createdAt "$NOW" \
             --arg updatedAt "$NOW" \
             --arg poll_at "$POLL_AT" \
-            --argjson timeout_seconds 180 \
-            --argjson poll_interval 20 \
-            --arg response_text "$RESPONSE" \
-            --arg analysis_text "$ANALYSIS" \
-            --arg inputmsg "$INPUT_MSG" \
-            --arg chath "$CHAT_HISTORY" \
-            --arg traveler "$TRAVELER_PROFILE" \
-            --arg travel_inputs "$TRAVEL_INPUTS" \
+            --arg response_text "$MESSAGE_EXTRACTED" \
+            --arg inputmsg "$INPUT_MESSAGE_RAW" \
+            --arg chath "$CHAT_HISTORY_RAW" \
+            --arg traveler "$TRAVELER_PROFILE_RAW" \
+            --arg travel_inputs "$TRAVEL_INPUTS_RAW" \
             --arg user_id "$USER_ID_VAR" \
-            --arg error_msg "$ERROR_MSG" \
             '{
               request_id: $rid,
               status: $status,
               createdAt: $createdAt,
               updatedAt: $updatedAt,
               poll_at: $poll_at,
-              timeout_seconds: $timeout_seconds,
-              poll_interval: $poll_interval,
+              timeout_seconds: 180,
+              poll_interval: 20,
               response: { text: $response_text },
-              analysis: $analysis_text,
-              InputMessage: $inputmsg,
+              InputMessage: ($inputmsg | fromjson? // $inputmsg),
               ChatHistory: ($chath | fromjson? // $chath),
               TravelerProfile: ($traveler | fromjson? // $traveler),
               TravelInputs: ($travel_inputs | fromjson? // $travel_inputs),
-              user_id: $user_id,
-              error: $error_msg
+              user_id: $user_id
             }'
           )
 
-          # Limpeza e extração da mensagem (robusta)
-          raw_response="${RESPONSE:-}"
-          raw_response=$(printf '%s' "$raw_response" | perl -0777 -pe 's/\r\n?/\n/g; s/^\x{FEFF}//;')
-          cleaned=$(printf '%s' "$raw_response" | perl -0777 -pe '
-            s/^\s*```[A-Za-z0-9_-]*\s*\n?//;
-            s/\n?```\s*$//;
-            s/^\s+//; s/\s+$//;
-            s/^json\s*({)/$1/;
-          ')
-          message_extracted=""
-          if printf '%s' "$cleaned" | jq -e . >/dev/null 2>&1; then
-            message_extracted=$(printf '%s' "$cleaned" | jq -r '.message // (. | tostring)' 2>/dev/null || true)
-          else
-            message_extracted="$cleaned"
-          fi
-          if [ -z "${message_extracted:-}" ]; then
-            message_extracted="$raw_response"
-          fi
+          echo "STATUS_JSON:"
+          echo "$STATUS_JSON" | jq .
 
-          # Preparar payload de polling (apenas para NEEDS_POLLING == "true")
-          PAYLOAD_POLLING=$(jq -n \
-            --arg rid "$REQUEST_ID" \
-            --arg response_text "$message_extracted" \
-            --arg input_msg "$INPUT_MSG" \
-            --arg user_id "$USER_ID_VAR" \
-            '{ request_id: $rid, response_text: $response_text, InputMessage: $input_msg, user_id: $user_id }'
-          )
-
-          # --- CONDICIONAL: somente criar status e notificar webhook se NEEDS_POLLING == "true" ---
+          # Only create status file and notify webhook if NEEDS_POLLING == "true"
           if [[ "${NEEDS_POLLING}" == "true" ]]; then
-            echo "NEEDS_POLLING=true -> creating status file and notifying webhook (polling scenario)."
+            echo "NEEDS_POLLING=true -> creating status file and notifying webhook."
 
             mkdir -p status
             echo "$STATUS_JSON" > status/$REQUEST_ID.json
@@ -258,14 +280,15 @@ jobs:
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add status/$REQUEST_ID.json
-            git commit -m "Write status for $REQUEST_ID (streaming result)" || echo "no changes"
+            git commit -m "Write status for $REQUEST_ID (streaming result)" || echo "no changes to commit"
             git push || echo "git push failed (continuing)"
 
-            # Enviar ao webhook (apenas payload de polling)
+            # Notify external webhook (if provided)
             if [ -n "${WEBHOOK_URL:-}" ]; then
+              PAYLOAD_NOTIFY=$(jq -n --arg rid "$REQUEST_ID" --argjson statusobj "$STATUS_JSON" '{ request_id: $rid, status: $statusobj }')
               EXTRA_HEADERS=()
               if [ -n "${WEBHOOK_SECRET:-}" ]; then
-                SIG='sha256='$(printf '%s' "$PAYLOAD_POLLING" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -binary | xxd -p -c 256)
+                SIG='sha256='$(printf '%s' "$PAYLOAD_NOTIFY" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -binary | xxd -p -c 256)
                 EXTRA_HEADERS+=("-H" "X-Hub-Signature-256: $SIG")
               fi
 
@@ -273,55 +296,35 @@ jobs:
               ATTEMPT=1
               SUCCESS=0
               while [ $ATTEMPT -le $MAX_RETRIES ]; do
-                echo "Posting polling payload to webhook (attempt $ATTEMPT)..."
                 HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$WEBHOOK_URL" \
                   -H "Content-Type: application/json" \
                   "${EXTRA_HEADERS[@]}" \
-                  --data-binary "$PAYLOAD_POLLING" || echo "000")
+                  --data-binary "$PAYLOAD_NOTIFY" || echo "000")
                 if [ "$HTTP_STATUS" = "200" ] || [ "$HTTP_STATUS" = "201" ] || [ "$HTTP_STATUS" = "204" ]; then
-                  echo "Webhook post succeeded (HTTP $HTTP_STATUS)."
                   SUCCESS=1
                   break
                 else
-                  echo "Webhook post failed (HTTP $HTTP_STATUS). Retrying..."
                   sleep $((2 ** ATTEMPT))
                   ATTEMPT=$((ATTEMPT + 1))
                 fi
               done
 
               if [ $SUCCESS -ne 1 ]; then
-                echo "All webhook attempts failed; last status $HTTP_STATUS. Continuing workflow."
+                echo "Webhook notify attempts failed; last status $HTTP_STATUS"
               fi
             else
-              echo "WEBHOOK_URL not provided; skipping webhook post."
+              echo "No WEBHOOK_URL provided; skipping notify."
             fi
 
           else
-            echo "NEEDS_POLLING != true -> skipping status file creation and webhook post (scenario 1)."
-            # Não criar status/$REQUEST_ID.json e não enviar webhook.
-            # (Mantemos processamento e extração da resposta, mas não notificamos.)
+            echo "NEEDS_POLLING != true -> skipping status file creation and webhook notify (scenario 1)."
+            # Optionally: still write a lightweight ack file or log, but per requirement we skip creating status file.
+            # If you want to persist the synchronous result even when NEEDS_POLLING != true, uncomment below:
+            # mkdir -p status
+            # echo "$STATUS_JSON" > status/$REQUEST_ID.json
           fi
-          # --- fim condicional ---
-
-          # Optional: Post to Google Sheets (Apps Script) se configurado (pode ser mantido independente do NEEDS_POLLING)
-          if [ -n "${GS_SCRIPT_URL:-}" ]; then
-            GS_PAYLOAD=$(jq -n \
-              --arg rid "$REQUEST_ID" \
-              --arg ts "$NOW" \
-              --arg text "$message_extracted" \
-              --arg input "$INPUT_MSG" \
-              --arg user_id "$USER_ID_VAR" \
-              '{request_id:$rid, timestamp:$ts, response_text:$text, InputMessage:$input, user_id:$user_id}')
-            if [ -n "${GS_SCRIPT_KEY:-}" ]; then
-              curl -s -X POST "$GS_SCRIPT_URL" -H "Content-Type: application/json" -H "X-Script-Key: $GS_SCRIPT_KEY" -d "$GS_PAYLOAD" || echo "GS post failed"
-            else
-              curl -s -X POST "$GS_SCRIPT_URL" -H "Content-Type: application/json" -d "$GS_PAYLOAD" || echo "GS post failed"
-            fi
-          fi
-
-          echo "Done processing request_id=$REQUEST_ID"
 
       - name: Post job cleanup
         if: always()
         run: |
-          echo "Post job cleanup."
+          echo "Process completed for request_id=${{ steps.read.outputs.request_id }}"
