@@ -1,4 +1,4 @@
-name: Fireworks AI Proxy
+name: Fireworks AI Proxy (streaming + compiled payload + polling)
 
 on:
   repository_dispatch:
@@ -6,8 +6,8 @@ on:
   workflow_dispatch:
     inputs:
       prompt:
-        description: 'Prompt para o Kimi K2'
-        required: true
+        description: 'Prompt para o Kimi K2 (fallback)'
+        required: false
         type: string
       request_id:
         description: 'ID único da requisição'
@@ -18,7 +18,7 @@ on:
         required: true
         type: string
       needs_polling:
-        description: 'true or false'
+        description: 'true or false (se deve criar status file e notificar)'
         required: false
         default: 'true'
 
@@ -33,39 +33,183 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Process Fireworks AI Streaming (fixed formatting + polling)
+      - name: Fireworks streaming + compiled message + polling
         env:
           FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
-          PROMPT: ${{ github.event.inputs.prompt || github.event.client_payload.prompt }}
-          REQUEST_ID: ${{ github.event.inputs.request_id || github.event.client_payload.request_id }}
-          WEBHOOK_URL: ${{ github.event.inputs.webhook_url || github.event.client_payload.webhook_url }}
           NEEDS_POLLING: ${{ github.event.inputs.needs_polling || github.event.client_payload.needs_polling || 'true' }}
         run: |
           set -euo pipefail
 
+          # --- Temp files and accumulators ---
+          RAW_STREAM_FILE=$(mktemp)
+          CURL_ERR_FILE=$(mktemp)
           ANALYSIS=""
           RESPONSE=""
           ERROR_MSG=""
 
-          # Helpers to append fragments without breaking words
+          # --- Extract client_payload fields robustly ---
+          EVENT_PATH="${GITHUB_EVENT_PATH:-}"
+          INPUT_MESSAGE_RAW=""
+          PROMPT_RAW=""
+          CHATHISTORY_RAW=""
+          TRAVELER_PROFILE_RAW=""
+          TRAVEL_INPUTS_RAW=""
+          REQUEST_ID=""
+          WEBHOOK_URL=""
+          USER_ID_RAW=""
+
+          if [ -n "$EVENT_PATH" ] && [ -f "$EVENT_PATH" ]; then
+            INPUT_MESSAGE_RAW=$(jq -c -r '.client_payload.input_message // .client_payload["59.json"] // .inputs.input_message // empty' "$EVENT_PATH" 2>/dev/null || true)
+            PROMPT_RAW=$(jq -c -r '.client_payload.prompt // .client_payload["99.json"] // .inputs.prompt // empty' "$EVENT_PATH" 2>/dev/null || true)
+            CHATHISTORY_RAW=$(jq -c -r '.client_payload.chathistory // .client_payload["56.json"] // .inputs.chathistory // empty' "$EVENT_PATH" 2>/dev/null || true)
+            TRAVELER_PROFILE_RAW=$(jq -c -r '.client_payload.traveler_profile // .client_payload["100.json"] // .inputs.traveler_profile // empty' "$EVENT_PATH" 2>/dev/null || true)
+            TRAVEL_INPUTS_RAW=$(jq -c -r '.client_payload.travel_inputs // .client_payload["101.json"] // .inputs.travel_inputs // empty' "$EVENT_PATH" 2>/dev/null || true)
+            REQUEST_ID=$(jq -r '.client_payload.request_id // .inputs.request_id // empty' "$EVENT_PATH" 2>/dev/null || true)
+            WEBHOOK_URL=$(jq -r '.client_payload.webhook_url // .inputs.webhook_url // empty' "$EVENT_PATH" 2>/dev/null || true)
+            USER_ID_RAW=$(jq -r '.client_payload.user_id // .client_payload["35.user_id"] // .inputs.user_id // empty' "$EVENT_PATH" 2>/dev/null || true)
+          fi
+
+          # Fallback to workflow_dispatch inputs if not present
+          if [ -z "$REQUEST_ID" ]; then
+            REQUEST_ID="${{ github.event.inputs.request_id || '' }}" || true
+          fi
+          if [ -z "$WEBHOOK_URL" ]; then
+            WEBHOOK_URL="${{ github.event.inputs.webhook_url || '' }}" || true
+          fi
+          if [ -z "$PROMPT_RAW" ] && [ -n "${{ github.event.inputs.prompt || '' }}" ]; then
+            PROMPT_RAW="${{ github.event.inputs.prompt || '' }}"
+          fi
+
+          # --- Helper: normalize JSON or string to readable text ---
+          normalize_to_text() {
+            local raw="$1"
+            if [ -z "$raw" ] || [ "$raw" = "null" ]; then
+              printf ''
+              return
+            fi
+            # If valid JSON, try to extract common text fields or stringify
+            if printf '%s' "$raw" | jq -e . >/dev/null 2>&1; then
+              # Prefer content/text fields if present; else join values or compact JSON
+              local extracted
+              extracted=$(printf '%s' "$raw" | jq -r '
+                if type=="object" then
+                  (.content // .text // (. | to_entries | map(.value|tostring) | join(" "))) 
+                elif type=="array" then
+                  (map(tostring) | join(" "))
+                else
+                  tostring
+                end' 2>/dev/null || true)
+              if [ -n "$extracted" ] && [ "$extracted" != "null" ]; then
+                printf '%s' "$extracted"
+              else
+                printf '%s' "$(printf '%s' "$raw" | jq -c . 2>/dev/null || printf '%s' "$raw")"
+              fi
+            else
+              # plain string: trim whitespace
+              printf '%s' "$(printf '%s' "$raw" | sed -e 's/^[[:space:]\n\r]*//' -e 's/[[:space:]\n\r]*$//')"
+            fi
+          }
+
+          # --- Build compiled message in requested order ---
+          part1=$(normalize_to_text "${INPUT_MESSAGE_RAW:-}")
+          part2=$(normalize_to_text "${PROMPT_RAW:-}")
+          part3=$(normalize_to_text "${CHATHISTORY_RAW:-}")
+          part4=$(normalize_to_text "${TRAVELER_PROFILE_RAW:-}")
+          part5=$(normalize_to_text "${TRAVEL_INPUTS_RAW:-}")
+          part6=$(normalize_to_text "${USER_ID_RAW:-}")
+
+          COMPILED_MESSAGE=""
+          for p in "$part1" "$part2" "$part3" "$part4" "$part5" "$part6"; do
+            if [ -n "$p" ]; then
+              if [ -z "$COMPILED_MESSAGE" ]; then
+                COMPILED_MESSAGE="$p"
+              else
+                COMPILED_MESSAGE="$COMPILED_MESSAGE"$'\n\n'"$p"
+              fi
+            fi
+          done
+
+          # Collapse excessive blank lines
+          COMPILED_MESSAGE="$(printf '%s' "$COMPILED_MESSAGE" | sed -E ':a;N;$!ba;s/\n{3,}/\n\n/g')"
+
+          echo "=== COMPILED_MESSAGE preview (first 2000 chars) ==="
+          printf '%s\n' "$COMPILED_MESSAGE" | head -c 2000 || true
+          echo "==================================================="
+
+          # --- Build ordered input object (kept for model compatibility) ---
+          to_json_or_null() {
+            local raw="$1"
+            if [ -z "$raw" ]; then
+              printf 'null'
+            else
+              if printf '%s' "$raw" | jq -e . >/dev/null 2>&1; then
+                printf '%s' "$raw"
+              else
+                printf '%s' "$(jq -Rn --arg s "$raw" '$s')"
+              fi
+            fi
+          }
+
+          INPUT_MESSAGE_JSON=$(to_json_or_null "$INPUT_MESSAGE_RAW")
+          PROMPT_JSON=$(to_json_or_null "$PROMPT_RAW")
+          CHATHISTORY_JSON=$(to_json_or_null "$CHATHISTORY_RAW")
+          TRAVELER_PROFILE_JSON=$(to_json_or_null "$TRAVELER_PROFILE_RAW")
+          TRAVEL_INPUTS_JSON=$(to_json_or_null "$TRAVEL_INPUTS_RAW")
+          USER_ID_JSON=$(to_json_or_null "$USER_ID_RAW")
+
+          PAYLOAD_SCENARIO1=$(jq -n \
+            --argjson input_message "$INPUT_MESSAGE_JSON" \
+            --argjson prompt "$PROMPT_JSON" \
+            --argjson chathistory "$CHATHISTORY_JSON" \
+            --argjson traveler_profile "$TRAVELER_PROFILE_JSON" \
+            --argjson travel_inputs "$TRAVEL_INPUTS_JSON" \
+            --argjson user_id "$USER_ID_JSON" \
+            '{
+              input_message: $input_message,
+              prompt: $prompt,
+              chathistory: $chathistory,
+              traveler_profile: $traveler_profile,
+              travel_inputs: $travel_inputs,
+              user_id: $user_id
+            }'
+          )
+
+          echo "=== PAYLOAD_SCENARIO1 (ordered) preview ==="
+          echo "$PAYLOAD_SCENARIO1" | jq . | head -c 2000 || true
+          echo "==========================================="
+
+          # --- Build REQUEST_BODY using compiled message as single user message (and keep input object) ---
+          REQUEST_BODY=$(jq -n \
+            --argjson ordered_input "$PAYLOAD_SCENARIO1" \
+            --arg compiled "$COMPILED_MESSAGE" \
+            --arg user_id "$USER_ID_RAW" \
+            '{
+              model: "accounts/fireworks/models/kimi-k2-thinking",
+              max_tokens: 4096,
+              top_p: 1,
+              top_k: 40,
+              presence_penalty: 0,
+              frequency_penalty: 0,
+              temperature: 1,
+              input: $ordered_input,
+              messages: [{ role: "user", content: $compiled }],
+              user: ($user_id // ""),
+              stream: true
+            }'
+          )
+
+          echo "=== REQUEST_BODY preview ==="
+          printf '%s\n' "$REQUEST_BODY" | jq . | head -c 4000 || true
+          echo "==========================="
+
+          # --- Smart append helpers (preserve formatting across fragments) ---
           append_response() {
             local frag="$1"
             frag="$(printf '%s' "$frag" | sed -e 's/^[[:space:]\n\r]*//' -e 's/[[:space:]\n\r]*$//')"
             if [ -z "$frag" ]; then return; fi
-            if [ -z "$RESPONSE" ]; then
-              RESPONSE="$frag"
-              return
-            fi
-            # If fragment starts with punctuation attach directly
-            if printf '%s' "$frag" | grep -qE '^[\.\,\!\?\:\;\)\]\}]'; then
-              RESPONSE+="$frag"
-              return
-            fi
-            # If RESPONSE ends with whitespace or opening punctuation, append directly
-            if printf '%s' "$RESPONSE" | grep -qE '[[:space:]]$|[\(\[\{]$'; then
-              RESPONSE+="$frag"
-              return
-            fi
+            if [ -z "$RESPONSE" ]; then RESPONSE="$frag"; return; fi
+            if printf '%s' "$frag" | grep -qE '^[\.\,\!\?\:\;\)\]\}]'; then RESPONSE+="$frag"; return; fi
+            if printf '%s' "$RESPONSE" | grep -qE '[[:space:]]$|[\(\[\{]$'; then RESPONSE+="$frag"; return; fi
             RESPONSE+=" $frag"
           }
 
@@ -73,28 +217,10 @@ jobs:
             local frag="$1"
             frag="$(printf '%s' "$frag" | sed -e 's/^[[:space:]\n\r]*//' -e 's/[[:space:]\n\r]*$//')"
             if [ -z "$frag" ]; then return; fi
-            if [ -z "$ANALYSIS" ]; then
-              ANALYSIS="$frag"
-            else
-              ANALYSIS+=" $frag"
-            fi
+            if [ -z "$ANALYSIS" ]; then ANALYSIS="$frag"; else ANALYSIS+=" $frag"; fi
           }
 
-          # Build request body safely (escape prompt)
-          REQUEST_BODY=$(jq -n --arg prompt "$PROMPT" '{
-            model: "accounts/fireworks/models/kimi-k2-thinking",
-            max_tokens: 16000,
-            temperature: 0.5,
-            messages: [{role: "user", content: $prompt}],
-            stream: true
-          }')
-
-          echo "REQUEST_BODY preview:"
-          printf '%s\n' "$REQUEST_BODY" | jq . | head -c 2000 || true
-
-          # Use process substitution so variables persist after the loop
-          RAW_STREAM_FILE=$(mktemp)
-          CURL_ERR_FILE=$(mktemp)
+          # --- Streaming loop (process substitution to preserve variables) ---
           LINE_NO=0
           DELTA_COUNT=0
           REASONING_COUNT=0
@@ -103,7 +229,6 @@ jobs:
             LINE_NO=$((LINE_NO+1))
             printf '%s\n' "$line" >> "$RAW_STREAM_FILE"
 
-            # handle SSE "data:" prefix and raw JSON lines
             if [[ $line == data:* ]]; then
               JSON_DATA="${line#data:}"
               JSON_DATA="${JSON_DATA# }"
@@ -111,26 +236,22 @@ jobs:
               JSON_DATA="$line"
             fi
 
-            # skip empty or DONE markers
             if [[ -z "$JSON_DATA" ]] || [[ "$JSON_DATA" == "[DONE]" ]]; then
               continue
             fi
 
-            # capture reasoning fragments
             PART_ANALYSIS=$(printf '%s' "$JSON_DATA" | jq -r '.choices? // [] | .[] | .delta? // {} | .reasoning_content? // empty' 2>/dev/null || true)
             if [[ -n "$PART_ANALYSIS" ]]; then
               REASONING_COUNT=$((REASONING_COUNT+1))
               append_reasoning "$PART_ANALYSIS"
             fi
 
-            # capture content fragments
             PART_RESPONSE=$(printf '%s' "$JSON_DATA" | jq -r '.choices? // [] | .[] | .delta? // {} | .content? // empty' 2>/dev/null || true)
             if [[ -n "$PART_RESPONSE" ]]; then
               DELTA_COUNT=$((DELTA_COUNT+1))
               append_response "$PART_RESPONSE"
             fi
 
-            # fallback: full message object
             FULL_MSG=$(printf '%s' "$JSON_DATA" | jq -r '.choices? // [] | .[] | .message? // empty' 2>/dev/null || true)
             if [[ -n "$FULL_MSG" && "$FULL_MSG" != "null" ]]; then
               MSG_CONTENT=$(printf '%s' "$FULL_MSG" | jq -r '.content // empty' 2>/dev/null || true)
@@ -139,33 +260,30 @@ jobs:
               fi
             fi
 
-            # capture error if present
             PART_ERROR=$(printf '%s' "$JSON_DATA" | jq -r '.error.message // empty' 2>/dev/null || true)
             if [[ -n "$PART_ERROR" ]]; then
-              if [[ -n "$ERROR_MSG" ]]; then
-                ERROR_MSG+=$'\n'"$PART_ERROR"
-              else
-                ERROR_MSG="$PART_ERROR"
-              fi
+              if [[ -n "$ERROR_MSG" ]]; then ERROR_MSG+=$'\n'"$PART_ERROR"; else ERROR_MSG="$PART_ERROR"; fi
             fi
+
           done < <(
             curl --no-buffer -s -N https://api.fireworks.ai/inference/v1/chat/completions \
               -H "Authorization: Bearer $FIREWORKS_API_KEY" \
               -H "Content-Type: application/json" \
+              -H "Accept: text/event-stream, application/json" \
               -d "$REQUEST_BODY" 2> "$CURL_ERR_FILE"
           )
 
-          # debug outputs
+          # --- After stream ends: debug and finalize ---
           if [ -s "$CURL_ERR_FILE" ]; then
             echo "CURL STDERR (preview):"
             head -c 2000 "$CURL_ERR_FILE" || true
           fi
 
-          echo "STREAM finished. lines:$LINE_NO fragments:$DELTA_COUNT reasoning_fragments:$REASONING_COUNT"
-          echo "Raw stream preview:"
+          echo "STREAM finished. Lines received: $LINE_NO, content fragments: $DELTA_COUNT, reasoning fragments: $REASONING_COUNT"
+          echo "Raw stream preview (first 2000 chars):"
           head -c 2000 "$RAW_STREAM_FILE" || true
+          echo
 
-          # trim
           RESPONSE="$(printf '%s' "$RESPONSE" | sed -e 's/^[[:space:]\n\r]*//' -e 's/[[:space:]\n\r]*$//')"
           ANALYSIS="$(printf '%s' "$ANALYSIS" | sed -e 's/^[[:space:]\n\r]*//' -e 's/[[:space:]\n\r]*$//')"
           ERROR_MSG="$(printf '%s' "$ERROR_MSG" | sed -e 's/^[[:space:]\n\r]*//' -e 's/[[:space:]\n\r]*$//')"
@@ -179,19 +297,20 @@ jobs:
             echo "WARN: response empty after parsing -> using fallback marker"
           fi
 
-          # Build safe minimal payload for webhook (status)
+          # --- Build minimal payload for webhook (status) ---
           MINIMAL_PAYLOAD=$(jq -n \
             --arg rid "$REQUEST_ID" \
             --arg status "completed" \
             --arg response_text "$RESPONSE" \
             --arg reasoning_text "$ANALYSIS" \
             --arg error_text "$ERROR_MSG" \
-            '{request_id: $rid, status: $status, response: { text: $response_text }, reasoning: $reasoning_text, error: $error_text}')
+            --arg user_id "$USER_ID_RAW" \
+            '{request_id: $rid, status: $status, response: { text: $response_text }, reasoning: $reasoning_text, error: $error_text, user_id: $user_id}')
 
-          echo "Payload to send (preview):"
+          echo "Payload a enviar para webhook (preview):"
           echo "$MINIMAL_PAYLOAD" | jq .
 
-          # Polling: write status file and notify webhook if requested
+          # --- Polling: write status file and notify webhook if requested ---
           if [[ "${NEEDS_POLLING}" == "true" ]]; then
             mkdir -p status
             echo "$MINIMAL_PAYLOAD" > "status/${REQUEST_ID}.json"
@@ -214,8 +333,7 @@ jobs:
             echo "NEEDS_POLLING != true -> skipping status file creation and webhook notify."
           fi
 
-          # cleanup
+          # Cleanup
           rm -f "$RAW_STREAM_FILE" "$CURL_ERR_FILE" || true
 
           echo "Done processing request_id=$REQUEST_ID"
-          
