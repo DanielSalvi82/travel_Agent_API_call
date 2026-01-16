@@ -1,4 +1,4 @@
-name: Fireworks proxy (minimal status + reasoning debug)
+name: Fireworks proxy (stream debug + reasoning)
 
 permissions:
   contents: write
@@ -73,7 +73,7 @@ jobs:
 
           echo "user_id_input=$USER_ID_INPUT" >> $GITHUB_OUTPUT
 
-      - name: Call Fireworks model (ordered payload, streaming + reasoning debug)
+      - name: Call Fireworks model (stream debug + reasoning)
         id: call_fireworks
         env:
           FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
@@ -87,7 +87,6 @@ jobs:
           USER_ID_VAR: ${{ steps.read.outputs.user_id_input }}
         run: |
           set -euo pipefail
-
           # helper: convert raw to JSON or JSON-string
           to_json_or_null() {
             local raw="$1"
@@ -146,6 +145,33 @@ jobs:
             }')
           fi
 
+          echo "=== PRE-TEST: quick POST to check HTTP status and headers ==="
+          # quick non-stream POST to inspect status and headers (timeout short)
+          TMP_HEADERS=$(mktemp)
+          TMP_BODY=$(mktemp)
+          HTTP_CODE=$(curl -s -S -X POST https://api.fireworks.ai/inference/v1/chat/completions \
+            -H "Authorization: Bearer $FIREWORKS_API_KEY" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            -D "$TMP_HEADERS" \
+            -o "$TMP_BODY" \
+            -w "%{http_code}" \
+            --max-time 10 \
+            -d "$REQUEST_BODY" || echo "000")
+          echo "Pre-test HTTP code: $HTTP_CODE"
+          echo "Pre-test headers (first 2000 chars):"
+          head -c 2000 "$TMP_HEADERS" || true
+          echo
+          echo "Pre-test body (first 2000 chars):"
+          head -c 2000 "$TMP_BODY" || true
+          echo
+
+          # If pre-test returned non-2xx, log and continue to streaming attempt (useful for debugging)
+          if [[ "$HTTP_CODE" != "200" && "$HTTP_CODE" != "201" && "$HTTP_CODE" != "204" ]]; then
+            echo "WARN: pre-test returned HTTP $HTTP_CODE (server may still stream on separate endpoint). Proceeding to streaming attempt for debug."
+          fi
+          rm -f "$TMP_HEADERS" "$TMP_BODY"
+
           echo "Calling Fireworks (stream=${NEEDS_POLLING})..."
 
           # Initialize accumulators and counters
@@ -155,42 +181,73 @@ jobs:
           REASONING_TEXT=""
           DELTA_COUNT=0
           REASONING_COUNT=0
+          CURL_EXIT=0
 
           if [[ "${NEEDS_POLLING}" == "true" ]]; then
-            # streaming: accumulate pieces into RESPONSE_RAW and REASONING_RAW
-            while IFS= read -r line; do
-              if [[ $line == data:* ]]; then
-                JSON_DATA="${line#data:}"
-                JSON_TRIM=$(printf '%s' "$JSON_DATA" | tr -d '\r\n')
-                if [[ "$JSON_TRIM" == "[DONE]" ]]; then
-                  echo "STREAM: received [DONE]"
-                  break
-                fi
-                if [[ -n "$JSON_TRIM" ]]; then
-                  # append raw line for debug
-                  RESPONSE_RAW+="$JSON_TRIM"$'\n'
-
-                  # try to parse reasoning fragment (delta.reasoning_content)
-                  FRAG_REASONING=$(printf '%s' "$JSON_TRIM" | jq -r '.choices? // [] | .[] | .delta? // {} | .reasoning_content? // empty' 2>/dev/null || true)
-                  if [[ -n "$FRAG_REASONING" ]]; then
-                    REASONING_RAW+="$FRAG_REASONING"
-                    REASONING_COUNT=$((REASONING_COUNT+1))
-                  fi
-
-                  # try to parse content fragment (delta.content)
-                  FRAG_CONTENT=$(printf '%s' "$JSON_TRIM" | jq -r '.choices? // [] | .[] | .delta? // {} | .content? // empty' 2>/dev/null || true)
-                  if [[ -n "$FRAG_CONTENT" ]]; then
-                    RESPONSE_TEXT+="$FRAG_CONTENT"
-                    DELTA_COUNT=$((DELTA_COUNT+1))
-                  fi
-                fi
-              fi
-            done < <(
-              curl -s -N https://api.fireworks.ai/inference/v1/chat/completions \
+            # streaming: use --no-buffer and Accept: text/event-stream to reduce buffering
+            # We'll parse both SSE 'data:' lines and raw JSON chunks
+            echo "STREAM: starting curl --no-buffer (this will block until stream ends or connection closes)"
+            # Use a subshell to capture curl exit code
+            (
+              curl --no-buffer -s -N https://api.fireworks.ai/inference/v1/chat/completions \
                 -H "Authorization: Bearer $FIREWORKS_API_KEY" \
                 -H "Content-Type: application/json" \
+                -H "Accept: text/event-stream, application/json" \
                 -d "$REQUEST_BODY"
-            )
+            ) 2>/tmp/fireworks_curl_err.log | while IFS= read -r line; do
+              # handle both SSE "data: ..." and raw JSON lines
+              if [[ $line == data:* ]]; then
+                JSON_DATA="${line#data:}"
+              else
+                JSON_DATA="$line"
+              fi
+
+              JSON_TRIM=$(printf '%s' "$JSON_DATA" | tr -d '\r\n')
+              if [[ "$JSON_TRIM" == "[DONE]" ]]; then
+                echo "STREAM: received [DONE]"
+                continue
+              fi
+              if [[ -z "$JSON_TRIM" ]]; then
+                continue
+              fi
+
+              # append raw for debug
+              RESPONSE_RAW+="$JSON_TRIM"$'\n'
+
+              # try to extract reasoning fragment (delta.reasoning_content)
+              FRAG_REASONING=$(printf '%s' "$JSON_TRIM" | jq -r '.choices? // [] | .[] | .delta? // {} | .reasoning_content? // empty' 2>/dev/null || true)
+              if [[ -n "$FRAG_REASONING" ]]; then
+                REASONING_RAW+="$FRAG_REASONING"
+                REASONING_COUNT=$((REASONING_COUNT+1))
+              fi
+
+              # try to extract content fragment (delta.content)
+              FRAG_CONTENT=$(printf '%s' "$JSON_TRIM" | jq -r '.choices? // [] | .[] | .delta? // {} | .content? // empty' 2>/dev/null || true)
+              if [[ -n "$FRAG_CONTENT" ]]; then
+                RESPONSE_TEXT+="$FRAG_CONTENT"
+                DELTA_COUNT=$((DELTA_COUNT+1))
+              fi
+
+              # also try to capture full message fields if present
+              FULL_MSG=$(printf '%s' "$JSON_TRIM" | jq -r '.choices? // [] | .[] | .message? // empty' 2>/dev/null || true)
+              if [[ -n "$FULL_MSG" && "$FULL_MSG" != "null" ]]; then
+                # if message contains content field, extract it
+                MSG_CONTENT=$(printf '%s' "$FULL_MSG" | jq -r '.content // empty' 2>/dev/null || true)
+                if [[ -n "$MSG_CONTENT" ]]; then
+                  RESPONSE_TEXT+="$MSG_CONTENT"
+                else
+                  RESPONSE_TEXT+="$FULL_MSG"
+                fi
+              fi
+            done
+            CURL_EXIT=$? || true
+
+            # capture any curl stderr for debugging
+            if [ -s /tmp/fireworks_curl_err.log ]; then
+              echo "CURL STDERR (first 2000 chars):"
+              head -c 2000 /tmp/fireworks_curl_err.log || true
+            fi
+            rm -f /tmp/fireworks_curl_err.log || true
 
             # Debug summary
             echo "STREAM DEBUG: delta fragments collected: $DELTA_COUNT"
@@ -215,7 +272,6 @@ jobs:
 
             # If REASONING_TEXT empty, try to reconstruct from accumulated JSON lines
             if [ -z "$REASONING_TEXT" ]; then
-              # Try to extract reasoning fragments from the accumulated JSON lines as well
               REASONING_TEXT=$(printf '%s' "$RESPONSE_RAW" | jq -r -s '
                 map(select(. != "" ) | fromjson? ) |
                 (map(.choices? // [] | .[] | .delta? // {} | .reasoning_content? // empty) | join("")) as $r |
@@ -231,6 +287,8 @@ jobs:
             if [ -z "$REASONING_TEXT" ]; then
               REASONING_TEXT=$(printf '%s' "$REASONING_RAW" | tr -d '\r\n')
             fi
+
+            echo "STREAM finished with curl exit code: $CURL_EXIT"
 
           else
             # synchronous call
