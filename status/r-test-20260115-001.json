@@ -1,0 +1,19 @@
+{
+  "request_id": "r-test-20260115-001",
+  "status": "completed",
+  "createdAt": "2026-01-16T02:24:26Z",
+  "updatedAt": "2026-01-16T02:24:26Z",
+  "poll_at": "2026-01-16T02:24:56Z",
+  "timeout_seconds": 180,
+  "poll_interval": 20,
+  "response": {
+    "text": "# Teste Rápido de Streaming## 1. Teste de Velocidade OnlineAcesse: **fast.com** (criado pela Netflix)- Testa especificamente velocidade para streaming- Mostra se sua conexão suporta qualidade (SD, HD, 4K)**Mínimos recomendados:**- SD (480p): 3 Mbps- HD (1080p): 5 Mbps- 4K: 25 Mbps## 2. Teste via Terminal (Linux/macOS)```bash# Teste de download simulando streamingcurl -o /dev/null http://ipv4.download.thinkbroadband.com/100MB.zip# Teste de estabilidade (ping contínuo)ping -c 50 8.8.8.8```## 3. Lista de Verificação Rápida- [ ] **Velocidade:** fast.com > 5 Mbps?- [ ] **Estabilidade:** Ping estável sem perdas?- [ ] **Bufferbloat:** Teste em waveform.com/tools/bufferbloat- [ ] **DNS:** Tente 8.8.8.8 ou 1.1.1.1- [ ] **VPN:** Desative se estiver lento- [ ] **Wi-Fi:** Teste perto do roteador (5GHz)## 4. Teste de Vídeo HTML (para desenvolvedores)```html<video src=\"https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8\" controls autoplay></video>```**Qual problema específico está enfrentando?**"
+  },
+  "analysis": "O usuário está pedindo um \"teste rápido de streaming\". Isso pode significar várias coisas:1. Um teste de velocidade de internet específico para streaming2. Um teste para verificar se o dispositivo consegue fazer streaming3. Um código simples para testar streaming de vídeo/áudio4. Uma lista de verificação rápida para diagnosticar problemas de streamingVou assumir que o usuário quer uma solução prática e rápida que possa usar imediatamente. Vou fornecer:1. Um teste de velocidade online específico para streaming2. Comandos simples para testar via terminal (para usuários mais técnicos)3. Uma lista de verificação rápida4. Um código HTML simples para testar streaming de vídeo (se for um desenvolvedor)Vou responder em português já que a pergunta foi em português.",
+  "InputMessage": "{\"messages\":[{\"role\":\"user\",\"content\":\"Teste rápido de streaming\"}]}",
+  "ChatHistory": [],
+  "TravelerProfile": {},
+  "TravelInputs": {},
+  "user_id": "",
+  "error": ""
+}
