@@ -1,4 +1,4 @@
-name: Fireworks proxy sync (streaming + full payload support)
+name: Fireworks proxy sync (streaming + minimal Make callback)
 
 on:
   workflow_dispatch:
@@ -33,7 +33,6 @@ jobs:
         id: read
         run: |
           # Extract compact JSON/string fields from event payload (works for workflow_dispatch and repository_dispatch)
-          # Use jq -c to keep objects compacted when present
           PROMPT_RAW=$(jq -c -r '.client_payload.prompt // .inputs.prompt // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || true)
           REQUEST_ID=$(jq -r '.client_payload.request_id // .inputs.request_id // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || true)
           WEBHOOK_URL=$(jq -r '.client_payload.webhook_url // .inputs.webhook_url // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || true)
@@ -45,7 +44,7 @@ jobs:
           TRAVEL_INPUTS=$(jq -c -r '.client_payload.travel_inputs // .client_payload.TravelInputs // .inputs.travel_inputs // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || true)
           USER_ID=$(jq -r '.client_payload.user_id // .client_payload.userID // .inputs.user_id // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || true)
 
-          # Fallback: if workflow_dispatch inputs exist under github.event.inputs
+          # Fallback to github.event.inputs if needed
           if [ -z "$PROMPT_RAW" ]; then
             PROMPT_RAW="${{ github.event.inputs.prompt || '' }}"
           fi
@@ -106,13 +105,9 @@ jobs:
           ERROR_MSG=""
 
           # Build request body:
-          # If PROMPT_RAW is a JSON array/object (compact), use it as messages; otherwise treat as simple string prompt.
           IS_JSON=$(printf '%s' "$PROMPT_RAW" | jq -e . >/dev/null 2>&1 && echo "true" || echo "false")
           if [ "$IS_JSON" = "true" ]; then
-            # PROMPT_RAW is JSON (e.g., messages array or object). We'll pass it as messages if it's an array,
-            # or as messages: [{role:"system", content: ...}] if it's an object with system prompt.
-            # Try to detect array vs object:
-            TYPE=$(printf '%s' "$PROMPT_RAW" | jq -r 'if type=="array" then "array" else "object" end' 2>/dev/null || echo "object")
+            TYPE=$(printf '%s' "$PROMPT_RAW" | jq -r 'type' 2>/dev/null || echo "string")
             if [ "$TYPE" = "array" ]; then
               REQUEST_BODY=$(jq -n --argjson msgs "$PROMPT_RAW" '{
                 model: "accounts/fireworks/models/kimi-k2-thinking",
@@ -122,7 +117,6 @@ jobs:
                 stream: true
               }')
             else
-              # object: assume it contains fields like system_prompt or messages; if it has "messages" use it
               HAS_MESSAGES=$(printf '%s' "$PROMPT_RAW" | jq 'has("messages")' 2>/dev/null || echo "false")
               if [ "$HAS_MESSAGES" = "true" ]; then
                 REQUEST_BODY=$(jq -n --argjson obj "$PROMPT_RAW" '{
@@ -133,7 +127,6 @@ jobs:
                   stream: true
                 }')
               else
-                # fallback: convert object to a single system message
                 REQUEST_BODY=$(jq -n --argjson obj "$PROMPT_RAW" '{
                   model: "accounts/fireworks/models/kimi-k2-thinking",
                   max_tokens: 16000,
@@ -144,7 +137,6 @@ jobs:
               fi
             fi
           else
-            # PROMPT_RAW is a plain string
             REQUEST_BODY=$(jq -n --arg prompt "$PROMPT_RAW" '{
               model: "accounts/fireworks/models/kimi-k2-thinking",
               max_tokens: 16000,
@@ -167,8 +159,7 @@ jobs:
                 break
               fi
               if [[ -n "$JSON_TRIM" ]]; then
-                # debug partial
-                printf '%s\n' "$JSON_TRIM" | jq . || true
+                # optional debug: printf '%s\n' "$JSON_TRIM" | jq . || true
 
                 PART_ANALYSIS=$(printf '%s' "$JSON_TRIM" | jq -r '.choices[0].delta.reasoning_content // empty' 2>/dev/null || true)
                 if [[ -n "$PART_ANALYSIS" ]]; then
@@ -281,7 +272,7 @@ jobs:
           git commit -m "Write status for $REQUEST_ID (streaming result)" || echo "no changes"
           git push
 
-          # Post to Google Sheets (Apps Script) if configured (we send InputMessage and request_id; adapt if you want more)
+          # Post to Google Sheets (Apps Script) if configured (optional)
           if [ -n "${GS_SCRIPT_URL:-}" ]; then
             GS_PAYLOAD=$(jq -n \
               --arg rid "$REQUEST_ID" \
@@ -299,23 +290,20 @@ jobs:
             echo "GS_SCRIPT_URL not configured; skipping Google Sheets post."
           fi
 
-          # Notify Make via webhook_url (if provided) with retry (3 attempts), no secret header
+          # Notify Make via webhook_url (minimal payload: request_id, response_text, InputMessage, user_id)
           if [ -n "${WEBHOOK_URL:-}" ]; then
             OUT_PAYLOAD=$(jq -n \
               --arg rid "$REQUEST_ID" \
               --arg response "$RESPONSE" \
               --arg input "$INPUT_MSG" \
-              --arg chath "$CHAT_HISTORY" \
-              --arg traveler "$TRAVELER_PROFILE" \
-              --arg travel_inputs "$TRAVEL_INPUTS" \
               --arg user_id "$UID" \
-              '{request_id:$rid, response_text:$response, InputMessage:$input, ChatHistory:$chath, TravelerProfile:$traveler, TravelInputs:$travel_inputs, user_id:$user_id}')
+              '{request_id:$rid, response_text:$response, InputMessage:$input, user_id:$user_id}')
             MAX_RETRIES=3
             SLEEP_BASE=2
             ATTEMPT=1
             SUCCESS=0
             while [ $ATTEMPT -le $MAX_RETRIES ]; do
-              echo "Posting to Make webhook (attempt $ATTEMPT)..."
+              echo "Posting minimal payload to Make webhook (attempt $ATTEMPT)..."
               HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$WEBHOOK_URL" -H "Content-Type: application/json" -d "$OUT_PAYLOAD" || echo "000")
               if [ "$HTTP_STATUS" = "200" ] || [ "$HTTP_STATUS" = "201" ] || [ "$HTTP_STATUS" = "204" ]; then
                 echo "Webhook post succeeded (HTTP $HTTP_STATUS)."
