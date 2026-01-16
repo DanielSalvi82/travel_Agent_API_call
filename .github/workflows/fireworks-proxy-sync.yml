@@ -1,4 +1,4 @@
-name: Fireworks proxy sync (streaming + minimal Make callback)
+name: Fireworks proxy sync (streaming + minimal Make callback) - fixed
 
 on:
   workflow_dispatch:
@@ -42,7 +42,7 @@ jobs:
           CHAT_HISTORY=$(jq -c -r '.client_payload.chathistory // .client_payload.ChatHistory // .inputs.chathistory // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || true)
           TRAVELER_PROFILE=$(jq -c -r '.client_payload.traveler_profile // .client_payload.TravelerProfile // .inputs.traveler_profile // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || true)
           TRAVEL_INPUTS=$(jq -c -r '.client_payload.travel_inputs // .client_payload.TravelInputs // .inputs.travel_inputs // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || true)
-          USER_ID=$(jq -r '.client_payload.user_id // .client_payload.userID // .inputs.user_id // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || true)
+          USER_ID_INPUT=$(jq -r '.client_payload.user_id // .client_payload.userID // .inputs.user_id // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || true)
 
           # Fallback to github.event.inputs if needed
           if [ -z "$PROMPT_RAW" ]; then
@@ -81,7 +81,8 @@ jobs:
           echo "$TRAVEL_INPUTS" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-          echo "user_id=$USER_ID" >> $GITHUB_OUTPUT
+          # Use a non-reserved name for the user id output to avoid shell readonly conflicts
+          echo "user_id_input=$USER_ID_INPUT" >> $GITHUB_OUTPUT
 
       - name: Process Fireworks AI Streaming and persist results
         env:
@@ -94,7 +95,7 @@ jobs:
           CHAT_HISTORY_RAW: ${{ steps.read.outputs.chathistory }}
           TRAVELER_PROFILE_RAW: ${{ steps.read.outputs.traveler_profile }}
           TRAVEL_INPUTS_RAW: ${{ steps.read.outputs.travel_inputs }}
-          USER_ID: ${{ steps.read.outputs.user_id }}
+          USER_ID_INPUT: ${{ steps.read.outputs.user_id_input }}
           GS_SCRIPT_URL: ${{ secrets.GS_SCRIPT_URL }}
           GS_SCRIPT_KEY: ${{ secrets.GS_SCRIPT_KEY }}
         run: |
@@ -192,7 +193,8 @@ jobs:
           CHAT_HISTORY="${CHAT_HISTORY_RAW:-[]}"
           TRAVELER_PROFILE="${TRAVELER_PROFILE_RAW:-{}}"
           TRAVEL_INPUTS="${TRAVEL_INPUTS_RAW:-{}}"
-          UID="${USER_ID:-}"
+          # Use a non-reserved shell variable name for the user id
+          USER_ID_VAR="${USER_ID_INPUT:-}"
 
           NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
           POLL_AT=$(date -u -d "+30 seconds" +"%Y-%m-%dT%H:%M:%SZ")
@@ -214,7 +216,7 @@ jobs:
               --arg chath "$CHAT_HISTORY" \
               --arg traveler "$TRAVELER_PROFILE" \
               --arg travel_inputs "$TRAVEL_INPUTS" \
-              --arg user_id "$UID" \
+              --arg user_id "$USER_ID_VAR" \
               --arg error_msg "$ERROR_MSG" \
               '{
                 request_id: $rid,
@@ -246,7 +248,7 @@ jobs:
               --arg chath "$CHAT_HISTORY" \
               --arg traveler "$TRAVELER_PROFILE" \
               --arg travel_inputs "$TRAVEL_INPUTS" \
-              --arg user_id "$UID" \
+              --arg user_id "$USER_ID_VAR" \
               --arg error_msg "$ERROR_MSG" \
               '{
                 request_id: $rid,
@@ -279,7 +281,7 @@ jobs:
               --arg ts "$NOW" \
               --arg text "$RESPONSE" \
               --arg input "$INPUT_MSG" \
-              --arg user_id "$UID" \
+              --arg user_id "$USER_ID_VAR" \
               '{request_id:$rid, timestamp:$ts, response_text:$text, InputMessage:$input, user_id:$user_id}')
             if [ -n "${GS_SCRIPT_KEY:-}" ]; then
               curl -s -X POST "$GS_SCRIPT_URL" -H "Content-Type: application/json" -H "X-Script-Key: $GS_SCRIPT_KEY" -d "$GS_PAYLOAD" || echo "GS post failed"
@@ -296,7 +298,7 @@ jobs:
               --arg rid "$REQUEST_ID" \
               --arg response "$RESPONSE" \
               --arg input "$INPUT_MSG" \
-              --arg user_id "$UID" \
+              --arg user_id "$USER_ID_VAR" \
               '{request_id:$rid, response_text:$response, InputMessage:$input, user_id:$user_id}')
             MAX_RETRIES=3
             SLEEP_BASE=2
