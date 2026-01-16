@@ -1,8 +1,8 @@
-name: Fireworks proxy sync (streaming + minimal Make callback) - fixed
+name: Fireworks proxy sync (streaming + minimal Make callback)
 
 permissions:
   contents: write
-  
+
 on:
   workflow_dispatch:
     inputs:
@@ -46,20 +46,6 @@ jobs:
           TRAVELER_PROFILE=$(jq -c -r '.client_payload.traveler_profile // .client_payload.TravelerProfile // .inputs.traveler_profile // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || true)
           TRAVEL_INPUTS=$(jq -c -r '.client_payload.travel_inputs // .client_payload.TravelInputs // .inputs.travel_inputs // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || true)
           USER_ID_INPUT=$(jq -r '.client_payload.user_id // .client_payload.userID // .inputs.user_id // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || true)
-
-          # Fallback to github.event.inputs if needed
-          if [ -z "$PROMPT_RAW" ]; then
-            PROMPT_RAW="${{ github.event.inputs.prompt || '' }}"
-          fi
-          if [ -z "$REQUEST_ID" ]; then
-            REQUEST_ID="${{ github.event.inputs.request_id || '' }}"
-          fi
-          if [ -z "$WEBHOOK_URL" ]; then
-            WEBHOOK_URL="${{ github.event.inputs.webhook_url || '' }}"
-          fi
-          if [ -z "$NEEDS_POLLING" ]; then
-            NEEDS_POLLING="${{ github.event.inputs.needs_polling || 'true' }}"
-          fi
 
           echo "prompt_raw<<EOF" >> $GITHUB_OUTPUT
           echo "$PROMPT_RAW" >> $GITHUB_OUTPUT
@@ -163,8 +149,6 @@ jobs:
                 break
               fi
               if [[ -n "$JSON_TRIM" ]]; then
-                # optional debug: printf '%s\n' "$JSON_TRIM" | jq . || true
-
                 PART_ANALYSIS=$(printf '%s' "$JSON_TRIM" | jq -r '.choices[0].delta.reasoning_content // empty' 2>/dev/null || true)
                 if [[ -n "$PART_ANALYSIS" ]]; then
                   ANALYSIS+="$PART_ANALYSIS"
@@ -203,7 +187,7 @@ jobs:
           POLL_AT=$(date -u -d "+30 seconds" +"%Y-%m-%dT%H:%M:%SZ")
           mkdir -p status
 
-          # Build status JSON including all inputs for traceability
+          # Build status JSON including all inputs for traceability (initial raw response stored)
           if [[ "${NEEDS_POLLING}" == "true" ]]; then
             STATUS_JSON=$(jq -n \
               --arg rid "$REQUEST_ID" \
@@ -275,16 +259,96 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add status/$REQUEST_ID.json
           git commit -m "Write status for $REQUEST_ID (streaming result)" || echo "no changes"
-          git push
+          git push || echo "git push failed (continuing)"
 
-          # Post to Google Sheets (Apps Script) if configured (optional)
+          # --- Início do bloco: limpeza, extração e envio ao webhook ---
+          raw_response="${RESPONSE:-}"
+
+          # 1) Remover code fences e prefixos comuns (```json, ```)
+          cleaned=$(printf '%s' "$raw_response" | sed -E 's/^```[[:alpha:]]*//; s/```$//; s/^\s+//; s/\s+$//')
+
+          # 2) Remover prefixos como "json{" -> "{"
+          cleaned=$(printf '%s' "$cleaned" | sed -E 's/^json\s*({)/\1/')
+
+          # 3) Se o texto for JSON, extrair .message quando existir
+          message_extracted=""
+          if printf '%s' "$cleaned" | jq -e . >/dev/null 2>&1; then
+            message_extracted=$(printf '%s' "$cleaned" | jq -r '.message // (. | tostring)' 2>/dev/null || true)
+          else
+            message_extracted="$cleaned"
+          fi
+
+          # 4) Fallback para a resposta bruta se ainda estiver vazio
+          if [ -z "${message_extracted:-}" ]; then
+            message_extracted="$raw_response"
+          fi
+
+          # 5) Preparar versões Markdown e HTML simples
+          response_text_markdown="$message_extracted"
+          escape_html() {
+            printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+          }
+          escaped=$(escape_html "$response_text_markdown")
+          response_text_html=$(printf '%s' "$escaped" | sed ':a;N;$!ba;s/\n/<br>/g')
+
+          # 6) Garantir user_id final (prioriza USER_ID_VAR, depois USER_ID_INPUT)
+          user_id_final="${USER_ID_VAR:-${USER_ID_INPUT:-}}"
+
+          # 7) Montar payload final com campos limpos e formatados
+          OUT_PAYLOAD=$(jq -n \
+            --arg rid "$REQUEST_ID" \
+            --arg response "$message_extracted" \
+            --arg md "$response_text_markdown" \
+            --arg html "$response_text_html" \
+            --arg input "$INPUT_MSG" \
+            --arg user_id "$user_id_final" \
+            '{
+              request_id: $rid,
+              response_text_clean: $response,
+              response_text_markdown: $md,
+              response_text_html: $html,
+              InputMessage: $input,
+              user_id: $user_id
+            }'
+          )
+
+          # 8) Enviar ao webhook com retries exponenciais
+          if [ -z "${WEBHOOK_URL:-}" ]; then
+            echo "No WEBHOOK_URL provided; skipping webhook post."
+          else
+            MAX_RETRIES=3
+            ATTEMPT=1
+            SUCCESS=0
+            while [ $ATTEMPT -le $MAX_RETRIES ]; do
+              echo "Posting cleaned payload to webhook (attempt $ATTEMPT)..."
+              HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$WEBHOOK_URL" \
+                -H "Content-Type: application/json" \
+                -d "$OUT_PAYLOAD" || echo "000")
+              if [ "$HTTP_STATUS" = "200" ] || [ "$HTTP_STATUS" = "201" ] || [ "$HTTP_STATUS" = "204" ]; then
+                echo "Webhook post succeeded (HTTP $HTTP_STATUS)."
+                SUCCESS=1
+                break
+              else
+                echo "Webhook post failed (HTTP $HTTP_STATUS). Retrying..."
+                sleep $((2 ** ATTEMPT))
+                ATTEMPT=$((ATTEMPT + 1))
+              fi
+            done
+
+            if [ $SUCCESS -ne 1 ]; then
+              echo "All webhook attempts failed; last status $HTTP_STATUS. Continuing workflow."
+            fi
+          fi
+          # --- Fim do bloco ---
+
+          # Optional: Post to Google Sheets (Apps Script) if configured
           if [ -n "${GS_SCRIPT_URL:-}" ]; then
             GS_PAYLOAD=$(jq -n \
               --arg rid "$REQUEST_ID" \
               --arg ts "$NOW" \
-              --arg text "$RESPONSE" \
+              --arg text "$message_extracted" \
               --arg input "$INPUT_MSG" \
-              --arg user_id "$USER_ID_VAR" \
+              --arg user_id "$user_id_final" \
               '{request_id:$rid, timestamp:$ts, response_text:$text, InputMessage:$input, user_id:$user_id}')
             if [ -n "${GS_SCRIPT_KEY:-}" ]; then
               curl -s -X POST "$GS_SCRIPT_URL" -H "Content-Type: application/json" -H "X-Script-Key: $GS_SCRIPT_KEY" -d "$GS_PAYLOAD" || echo "GS post failed"
@@ -295,38 +359,9 @@ jobs:
             echo "GS_SCRIPT_URL not configured; skipping Google Sheets post."
           fi
 
-          # Notify Make via webhook_url (minimal payload: request_id, response_text, InputMessage, user_id)
-          if [ -n "${WEBHOOK_URL:-}" ]; then
-            OUT_PAYLOAD=$(jq -n \
-              --arg rid "$REQUEST_ID" \
-              --arg response "$RESPONSE" \
-              --arg input "$INPUT_MSG" \
-              --arg user_id "$USER_ID_VAR" \
-              '{request_id:$rid, response_text:$response, InputMessage:$input, user_id:$user_id}')
-            MAX_RETRIES=3
-            SLEEP_BASE=2
-            ATTEMPT=1
-            SUCCESS=0
-            while [ $ATTEMPT -le $MAX_RETRIES ]; do
-              echo "Posting minimal payload to Make webhook (attempt $ATTEMPT)..."
-              HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$WEBHOOK_URL" -H "Content-Type: application/json" -d "$OUT_PAYLOAD" || echo "000")
-              if [ "$HTTP_STATUS" = "200" ] || [ "$HTTP_STATUS" = "201" ] || [ "$HTTP_STATUS" = "204" ]; then
-                echo "Webhook post succeeded (HTTP $HTTP_STATUS)."
-                SUCCESS=1
-                break
-              else
-                echo "Webhook post failed (HTTP $HTTP_STATUS)."
-                SLEEP_TIME=$((SLEEP_BASE ** ATTEMPT))
-                echo "Sleeping $SLEEP_TIME seconds before retry..."
-                sleep $SLEEP_TIME
-                ATTEMPT=$((ATTEMPT + 1))
-              fi
-            done
-            if [ $SUCCESS -ne 1 ]; then
-              echo "All webhook attempts failed; continuing. Make should handle retries or manual reconciliation."
-            fi
-          else
-            echo "No WEBHOOK_URL provided; skipping Make notification."
-          fi
-
           echo "Done processing request_id=$REQUEST_ID"
+
+      - name: Post job cleanup
+        if: always()
+        run: |
+          echo "Post job cleanup."
