@@ -1,5 +1,8 @@
 name: Fireworks proxy sync (streaming + minimal Make callback) - fixed
 
+permissions:
+  contents: write
+  
 on:
   workflow_dispatch:
     inputs:
