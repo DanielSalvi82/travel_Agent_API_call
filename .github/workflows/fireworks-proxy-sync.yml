@@ -1,4 +1,4 @@
-name: Fireworks AI Proxy (streaming, fixed variable scope)
+name: Fireworks AI Proxy (streaming, fixed formatting)
 
 on:
   repository_dispatch:
@@ -26,7 +26,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Process Fireworks AI Streaming (fixed)
+      - name: Process Fireworks AI Streaming (fixed formatting)
         env:
           FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
           PROMPT: ${{ github.event.inputs.prompt || github.event.client_payload.prompt }}
@@ -56,12 +56,54 @@ jobs:
           printf '%s\n' "$REQUEST_BODY" | head -c 2000 || true
           echo "=============================="
 
+          # Helper: append fragment to RESPONSE with smart spacing
+          append_response() {
+            local frag="$1"
+            # trim leading/trailing whitespace/newlines
+            frag="$(printf '%s' "$frag" | sed -e 's/^[[:space:]\n\r]*//' -e 's/[[:space:]\n\r]*$//')"
+            if [ -z "$frag" ]; then
+              return
+            fi
+            # If RESPONSE empty, set directly
+            if [ -z "$RESPONSE" ]; then
+              RESPONSE="$frag"
+              return
+            fi
+            # If fragment starts with punctuation that should attach to previous token, append directly
+            if printf '%s' "$frag" | grep -qE '^[\.\,\!\?\:\;\)\]\}]'; then
+              RESPONSE+="$frag"
+              return
+            fi
+            # If RESPONSE ends with opening punctuation or whitespace, append without extra space
+            if printf '%s' "$RESPONSE" | grep -qE '[[:space:]]$|[\(\[\{]$'; then
+              RESPONSE+="$frag"
+              return
+            fi
+            # Default: add single space then fragment
+            RESPONSE+=" $frag"
+          }
+
+          # Helper: append reasoning fragments with sensible spacing
+          append_reasoning() {
+            local frag="$1"
+            frag="$(printf '%s' "$frag" | sed -e 's/^[[:space:]\n\r]*//' -e 's/[[:space:]\n\r]*$//')"
+            if [ -z "$frag" ]; then
+              return
+            fi
+            if [ -z "$ANALYSIS" ]; then
+              ANALYSIS="$frag"
+            else
+              # separate reasoning fragments with a single space
+              ANALYSIS+=" $frag"
+            fi
+          }
+
           echo "STREAM: starting curl (process substitution) — will block until stream ends or connection closes"
           LINE_NO=0
           DELTA_COUNT=0
           REASONING_COUNT=0
 
-          # IMPORTANT: use process substitution (< <(...)) so the while loop runs in the current shell
+          # Use process substitution so variables persist after loop
           while IFS= read -r line; do
             LINE_NO=$((LINE_NO+1))
             TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -69,7 +111,7 @@ jobs:
             # Save raw line for later inspection
             printf '%s\n' "$line" >> "$RAW_STREAM_FILE"
 
-            # Short log per line (keeps logs readable)
+            # Short log per line
             echo "STREAM LINE $LINE_NO @ $TIMESTAMP"
             if printf '%s' "$line" | jq . >/dev/null 2>&1; then
               printf '%s\n' "$line" | jq . || true
@@ -79,7 +121,6 @@ jobs:
 
             # Handle SSE "data:" prefix and ignore [DONE]
             if [[ $line == data:* ]]; then
-              # remove leading 'data:' and optional space
               JSON_DATA="${line#data:}"
               JSON_DATA="${JSON_DATA# }"
             else
@@ -92,40 +133,28 @@ jobs:
               continue
             fi
 
-            # Try to extract reasoning fragment (delta.reasoning_content)
+            # Extract reasoning fragment (delta.reasoning_content)
             PART_ANALYSIS=$(printf '%s' "$JSON_DATA" | jq -r '.choices? // [] | .[] | .delta? // {} | .reasoning_content? // empty' 2>/dev/null || true)
             if [[ -n "$PART_ANALYSIS" ]]; then
               REASONING_COUNT=$((REASONING_COUNT+1))
-              if [[ -n "$ANALYSIS" ]]; then
-                ANALYSIS+=$'\n'"$PART_ANALYSIS"
-              else
-                ANALYSIS="$PART_ANALYSIS"
-              fi
+              append_reasoning "$PART_ANALYSIS"
               echo "STREAM: captured reasoning fragment (len=${#PART_ANALYSIS})"
             fi
 
-            # Try to extract content fragment (delta.content)
+            # Extract content fragment (delta.content)
             PART_RESPONSE=$(printf '%s' "$JSON_DATA" | jq -r '.choices? // [] | .[] | .delta? // {} | .content? // empty' 2>/dev/null || true)
             if [[ -n "$PART_RESPONSE" ]]; then
               DELTA_COUNT=$((DELTA_COUNT+1))
-              if [[ -n "$RESPONSE" ]]; then
-                RESPONSE+=$'\n'"$PART_RESPONSE"
-              else
-                RESPONSE="$PART_RESPONSE"
-              fi
+              append_response "$PART_RESPONSE"
               echo "STREAM: captured content fragment (len=${#PART_RESPONSE})"
             fi
 
-            # Also try to capture full message objects (non-delta)
+            # Also capture full message objects (non-delta)
             FULL_MSG=$(printf '%s' "$JSON_DATA" | jq -r '.choices? // [] | .[] | .message? // empty' 2>/dev/null || true)
             if [[ -n "$FULL_MSG" && "$FULL_MSG" != "null" ]]; then
               MSG_CONTENT=$(printf '%s' "$FULL_MSG" | jq -r '.content // empty' 2>/dev/null || true)
               if [[ -n "$MSG_CONTENT" ]]; then
-                if [[ -n "$RESPONSE" ]]; then
-                  RESPONSE+=$'\n'"$MSG_CONTENT"
-                else
-                  RESPONSE="$MSG_CONTENT"
-                fi
+                append_response "$MSG_CONTENT"
                 echo "STREAM: captured full message content (len=${#MSG_CONTENT})"
               fi
             fi
@@ -160,7 +189,7 @@ jobs:
           head -c 2000 "$RAW_STREAM_FILE" || true
           echo
 
-          # Trim leading/trailing whitespace/newlines from RESPONSE and ANALYSIS
+          # Trim whitespace
           RESPONSE="$(printf '%s' "$RESPONSE" | sed -e 's/^[[:space:]\n\r]*//' -e 's/[[:space:]\n\r]*$//')"
           ANALYSIS="$(printf '%s' "$ANALYSIS" | sed -e 's/^[[:space:]\n\r]*//' -e 's/[[:space:]\n\r]*$//')"
           ERROR_MSG="$(printf '%s' "$ERROR_MSG" | sed -e 's/^[[:space:]\n\r]*//' -e 's/[[:space:]\n\r]*$//')"
@@ -169,13 +198,13 @@ jobs:
           echo "Resposta capturada: ${#RESPONSE} caracteres"
           echo "Erro capturado: ${ERROR_MSG:-<none>}"
 
-          # If RESPONSE empty, mark explicitly so webhook consumer sees it
+          # If RESPONSE empty, explicit fallback
           if [ -z "${RESPONSE// }" ]; then
             RESPONSE="__NO_RESPONSE_FROM_MODEL__"
             echo "WARN: response empty after parsing -> using fallback marker"
           fi
 
-          # Build minimal payload for webhook: request_id, status, response.text, reasoning, error, user_id (empty if unknown)
+          # Build minimal payload for webhook
           MINIMAL_PAYLOAD=$(jq -n \
             --arg rid "$REQUEST_ID" \
             --arg status "completed" \
