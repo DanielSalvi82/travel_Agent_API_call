@@ -1,4 +1,4 @@
-name: Fireworks proxy (ordered payload, streaming + sync, conditional status + webhook)
+name: Fireworks proxy (minimal status webhook)
 
 permissions:
   contents: write
@@ -37,7 +37,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Read raw event payload (supports workflow_dispatch and repository_dispatch)
           PROMPT_RAW=$(jq -c -r '.client_payload.prompt // .inputs.prompt // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || true)
           REQUEST_ID=$(jq -r '.client_payload.request_id // .inputs.request_id // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || true)
           WEBHOOK_URL=$(jq -r '.client_payload.webhook_url // .inputs.webhook_url // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || true)
@@ -49,7 +48,6 @@ jobs:
           TRAVEL_INPUTS=$(jq -c -r '.client_payload.travel_inputs // .client_payload.TravelInputs // .inputs.travel_inputs // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || true)
           USER_ID_INPUT=$(jq -r '.client_payload.user_id // .client_payload.userID // .inputs.user_id // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || true)
 
-          # Export outputs
           echo "prompt_raw<<EOF" >> $GITHUB_OUTPUT
           echo "$PROMPT_RAW" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
@@ -75,11 +73,10 @@ jobs:
 
           echo "user_id_input=$USER_ID_INPUT" >> $GITHUB_OUTPUT
 
-      - name: Call Fireworks model (ordered payload, streaming + sync)
+      - name: Call Fireworks model (ordered payload, robust extraction)
         id: call_fireworks
         env:
           FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
-          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}        # optional: used when sending webhook back
           PROMPT_RAW: ${{ steps.read.outputs.prompt_raw }}
           REQUEST_ID: ${{ steps.read.outputs.request_id }}
           NEEDS_POLLING: ${{ steps.read.outputs.needs_polling }}
@@ -90,17 +87,16 @@ jobs:
           USER_ID_VAR: ${{ steps.read.outputs.user_id_input }}
         run: |
           set -euo pipefail
-          # Convert empty strings to null for jq --argjson usage
+
+          # helper: convert raw to JSON or JSON-string
           to_json_or_null() {
             local raw="$1"
             if [ -z "$raw" ]; then
               printf 'null'
             else
-              # try to parse as JSON; if fails, treat as string
               if printf '%s' "$raw" | jq -e . >/dev/null 2>&1; then
                 printf '%s' "$raw"
               else
-                # escape as JSON string
                 printf '%s' "$(jq -Rn --arg s "$raw" '$s')"
               fi
             fi
@@ -112,7 +108,7 @@ jobs:
           TRAVELER_PROFILE_JSON=$(to_json_or_null "$TRAVELER_PROFILE_RAW")
           TRAVEL_INPUTS_JSON=$(to_json_or_null "$TRAVEL_INPUTS_RAW")
 
-          # Build ordered payload for scenario 1 (explicit order)
+          # Build ordered payload for scenario 1
           PAYLOAD_SCENARIO1=$(jq -n \
             --argjson input_message "$INPUT_MESSAGE_JSON" \
             --argjson prompt "$PROMPT_JSON" \
@@ -128,11 +124,10 @@ jobs:
             }'
           )
 
-          echo "=== PAYLOAD_SCENARIO1 (ordered) ==="
+          echo "PAYLOAD_SCENARIO1:"
           echo "$PAYLOAD_SCENARIO1" | jq .
 
-          # Prepare request body for Fireworks model
-          # Use field "input" containing the ordered payload
+          # Prepare request body (input contains ordered payload)
           if [[ "${NEEDS_POLLING}" == "true" ]]; then
             REQUEST_BODY=$(jq -n --argjson ordered_input "$PAYLOAD_SCENARIO1" '{
               model: "accounts/fireworks/models/kimi-k2-thinking",
@@ -151,14 +146,13 @@ jobs:
             }')
           fi
 
-          echo "Calling Fireworks API (stream=${NEEDS_POLLING})..."
+          echo "Calling Fireworks (stream=${NEEDS_POLLING})..."
 
-          MESSAGE_EXTRACTED=""
-          ANALYSIS=""
-          ERROR_MSG=""
+          RESPONSE_RAW=""
+          RESPONSE_TEXT=""
 
           if [[ "${NEEDS_POLLING}" == "true" ]]; then
-            # Streaming call: accumulate response pieces
+            # streaming: accumulate pieces into RESPONSE_RAW
             while IFS= read -r line; do
               if [[ $line == data:* ]]; then
                 JSON_DATA="${line#data:}"
@@ -167,14 +161,7 @@ jobs:
                   break
                 fi
                 if [[ -n "$JSON_TRIM" ]]; then
-                  PART_ANALYSIS=$(printf '%s' "$JSON_TRIM" | jq -r '.choices[0].delta.reasoning_content // empty' 2>/dev/null || true)
-                  if [[ -n "$PART_ANALYSIS" ]]; then ANALYSIS+="$PART_ANALYSIS"; fi
-
-                  PART_RESPONSE=$(printf '%s' "$JSON_TRIM" | jq -r '.choices[0].delta.content // empty' 2>/dev/null || true)
-                  if [[ -n "$PART_RESPONSE" ]]; then RESPONSE+="$PART_RESPONSE"; fi
-
-                  PART_ERROR=$(printf '%s' "$JSON_TRIM" | jq -r '.error.message // empty' 2>/dev/null || true)
-                  if [[ -n "$PART_ERROR" ]]; then ERROR_MSG+="$PART_ERROR"; fi
+                  RESPONSE_RAW+="$JSON_TRIM"$'\n'
                 fi
               fi
             done < <(
@@ -184,108 +171,108 @@ jobs:
                 -d "$REQUEST_BODY"
             )
 
-            # Final best-effort extraction
-            MESSAGE_EXTRACTED="${RESPONSE:-$ANALYSIS}"
-            if [ -z "$MESSAGE_EXTRACTED" ]; then
-              MESSAGE_EXTRACTED="$ERROR_MSG"
+            # Try to extract best text from accumulated streaming JSON lines
+            # Strategy: look for delta.content fragments, then join; fallback to any message fields
+            RESPONSE_TEXT=$(printf '%s' "$RESPONSE_RAW" | jq -r -s '
+              map(select(. != "" ) | fromjson? ) |
+              (map(.choices? // [] | .[] | .delta? // {} | .content? // empty) | join("")) as $delta |
+              ($delta // "") as $d |
+              (if $d != "" then $d
+               else (map(.choices? // [] | .[] | .message? // {} | .content? // empty) | join("\n")) end)
+            ' 2>/dev/null || true)
+
+            # final fallback: raw text
+            if [ -z "$RESPONSE_TEXT" ]; then
+              RESPONSE_TEXT=$(printf '%s' "$RESPONSE_RAW" | tr -d '\r\n')
             fi
 
           else
-            # Synchronous call: get full JSON response
+            # synchronous call
             SYNC_RAW=$(curl -s -X POST https://api.fireworks.ai/inference/v1/chat/completions \
               -H "Authorization: Bearer $FIREWORKS_API_KEY" \
               -H "Content-Type: application/json" \
               -d "$REQUEST_BODY" || true)
 
-            # Try to pretty-print and extract best fields
-            echo "Fireworks sync raw response:"
+            echo "Fireworks sync raw:"
             echo "$SYNC_RAW" | jq . || echo "$SYNC_RAW"
 
-            # Try multiple extraction strategies
-            MESSAGE_EXTRACTED=$(printf '%s' "$SYNC_RAW" | jq -r '.choices[0].message.content // .choices[0].message // .response_text // .response.text // empty' 2>/dev/null || true)
-            if [ -z "$MESSAGE_EXTRACTED" ]; then
-              # fallback to entire response
-              MESSAGE_EXTRACTED="$SYNC_RAW"
+            # Extraction strategies (ordered preference)
+            RESPONSE_TEXT=$(printf '%s' "$SYNC_RAW" | jq -r '
+              .response_text_clean // .response_text_markdown // .response.text // .response_text // .choices[0].message.content // .choices[0].message // .choices[0].text // empty
+            ' 2>/dev/null || true)
+
+            if [ -z "$RESPONSE_TEXT" ]; then
+              # Try alternative nested fields or fallback to raw
+              RESPONSE_TEXT=$(printf '%s' "$SYNC_RAW" | jq -r '
+                (.. | objects | .response_text? // .response? // .text? // empty) | select(. != null) | tostring
+              ' 2>/dev/null | head -n 1 || true)
+            fi
+
+            if [ -z "$RESPONSE_TEXT" ]; then
+              RESPONSE_TEXT="$SYNC_RAW"
             fi
           fi
 
-          # Export message_extracted for later steps
+          # Trim whitespace
+          RESPONSE_TEXT=$(printf '%s' "$RESPONSE_TEXT" | sed -e 's/^[[:space:]\n\r]*//' -e 's/[[:space:]\n\r]*$//')
+
+          # Export outputs
           echo "message_extracted<<EOF" >> $GITHUB_OUTPUT
-          echo "$MESSAGE_EXTRACTED" >> $GITHUB_OUTPUT
+          echo "$RESPONSE_TEXT" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-          # Also expose the ordered payload for debugging or downstream use
           echo "payload_scenario1<<EOF" >> $GITHUB_OUTPUT
           echo "$PAYLOAD_SCENARIO1" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-      - name: Create status file and notify webhook (conditional on NEEDS_POLLING)
+      - name: Create minimal status and notify webhook (only request_id,status,response,user_id)
         env:
           REQUEST_ID: ${{ steps.read.outputs.request_id }}
           NEEDS_POLLING: ${{ steps.read.outputs.needs_polling }}
           WEBHOOK_URL: ${{ steps.read.outputs.webhook_url }}
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
           MESSAGE_EXTRACTED: ${{ steps.call_fireworks.outputs.message_extracted }}
-          INPUT_MESSAGE_RAW: ${{ steps.read.outputs.input_message }}
-          CHAT_HISTORY_RAW: ${{ steps.read.outputs.chathistory }}
-          TRAVELER_PROFILE_RAW: ${{ steps.read.outputs.traveler_profile }}
-          TRAVEL_INPUTS_RAW: ${{ steps.read.outputs.travel_inputs }}
           USER_ID_VAR: ${{ steps.read.outputs.user_id_input }}
         run: |
           set -euo pipefail
 
-          NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          POLL_AT=$(date -u -d "+10 seconds" +"%Y-%m-%dT%H:%M:%SZ" || date -u +"%Y-%m-%dT%H:%M:%SZ")
+          # Ensure we have a response text (fallback to empty string)
+          RESPONSE_TEXT="${MESSAGE_EXTRACTED:-}"
+          if [ -z "$RESPONSE_TEXT" ]; then
+            RESPONSE_TEXT=""
+          fi
 
-          # Build status JSON (useful for polling clients)
-          STATUS_JSON=$(jq -n \
+          # Build minimal status JSON with only required fields
+          MINIMAL_STATUS=$(jq -n \
             --arg rid "$REQUEST_ID" \
             --arg status "completed" \
-            --arg createdAt "$NOW" \
-            --arg updatedAt "$NOW" \
-            --arg poll_at "$POLL_AT" \
-            --arg response_text "$MESSAGE_EXTRACTED" \
-            --arg inputmsg "$INPUT_MESSAGE_RAW" \
-            --arg chath "$CHAT_HISTORY_RAW" \
-            --arg traveler "$TRAVELER_PROFILE_RAW" \
-            --arg travel_inputs "$TRAVEL_INPUTS_RAW" \
+            --arg response_text "$RESPONSE_TEXT" \
             --arg user_id "$USER_ID_VAR" \
             '{
               request_id: $rid,
               status: $status,
-              createdAt: $createdAt,
-              updatedAt: $updatedAt,
-              poll_at: $poll_at,
-              timeout_seconds: 180,
-              poll_interval: 20,
               response: { text: $response_text },
-              InputMessage: ($inputmsg | fromjson? // $inputmsg),
-              ChatHistory: ($chath | fromjson? // $chath),
-              TravelerProfile: ($traveler | fromjson? // $traveler),
-              TravelInputs: ($travel_inputs | fromjson? // $travel_inputs),
               user_id: $user_id
             }'
           )
 
-          echo "STATUS_JSON:"
-          echo "$STATUS_JSON" | jq .
+          echo "MINIMAL_STATUS:"
+          echo "$MINIMAL_STATUS" | jq .
 
-          # Only create status file and notify webhook if NEEDS_POLLING == "true"
           if [[ "${NEEDS_POLLING}" == "true" ]]; then
-            echo "NEEDS_POLLING=true -> creating status file and notifying webhook."
-
+            # write minimal status file
             mkdir -p status
-            echo "$STATUS_JSON" > status/$REQUEST_ID.json
+            echo "$MINIMAL_STATUS" > status/$REQUEST_ID.json
 
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add status/$REQUEST_ID.json
-            git commit -m "Write status for $REQUEST_ID (streaming result)" || echo "no changes to commit"
+            git commit -m "Write minimal status for $REQUEST_ID" || echo "no changes to commit"
             git push || echo "git push failed (continuing)"
 
-            # Notify external webhook (if provided)
+            # Notify external webhook with minimal payload
             if [ -n "${WEBHOOK_URL:-}" ]; then
-              PAYLOAD_NOTIFY=$(jq -n --arg rid "$REQUEST_ID" --argjson statusobj "$STATUS_JSON" '{ request_id: $rid, status: $statusobj }')
+              PAYLOAD_NOTIFY="$MINIMAL_STATUS"
               EXTRA_HEADERS=()
               if [ -n "${WEBHOOK_SECRET:-}" ]; then
                 SIG='sha256='$(printf '%s' "$PAYLOAD_NOTIFY" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -binary | xxd -p -c 256)
@@ -315,16 +302,11 @@ jobs:
             else
               echo "No WEBHOOK_URL provided; skipping notify."
             fi
-
           else
             echo "NEEDS_POLLING != true -> skipping status file creation and webhook notify (scenario 1)."
-            # Optionally: still write a lightweight ack file or log, but per requirement we skip creating status file.
-            # If you want to persist the synchronous result even when NEEDS_POLLING != true, uncomment below:
-            # mkdir -p status
-            # echo "$STATUS_JSON" > status/$REQUEST_ID.json
           fi
 
       - name: Post job cleanup
         if: always()
         run: |
-          echo "Process completed for request_id=${{ steps.read.outputs.request_id }}"
+          echo "Done processing request_id=${{ steps.read.outputs.request_id }}"
