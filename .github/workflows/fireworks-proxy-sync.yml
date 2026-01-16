@@ -1,4 +1,4 @@
-name: Fireworks AI Proxy (stream debug)
+name: Fireworks AI Proxy (streaming, fixed variable scope)
 
 on:
   repository_dispatch:
@@ -26,7 +26,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Process Fireworks AI Streaming (line-by-line debug)
+      - name: Process Fireworks AI Streaming (fixed)
         env:
           FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
           PROMPT: ${{ github.event.inputs.prompt || github.event.client_payload.prompt }}
@@ -39,7 +39,7 @@ jobs:
           RESPONSE=""
           ERROR_MSG=""
 
-          # Temp files for raw stream and curl stderr
+          # Temp files for raw stream and curl stderr (for debugging)
           RAW_STREAM_FILE=$(mktemp)
           CURL_ERR_FILE=$(mktemp)
 
@@ -56,30 +56,21 @@ jobs:
           printf '%s\n' "$REQUEST_BODY" | head -c 2000 || true
           echo "=============================="
 
-          echo "STREAM: starting curl --no-buffer (this will block until stream ends or connection closes)"
+          echo "STREAM: starting curl (process substitution) — will block until stream ends or connection closes"
           LINE_NO=0
           DELTA_COUNT=0
           REASONING_COUNT=0
 
-          # Use a subshell to capture curl stderr separately and pipe stdout to the while loop
-          (
-            curl --no-buffer -s -N https://api.fireworks.ai/inference/v1/chat/completions \
-              -H "Authorization: Bearer $FIREWORKS_API_KEY" \
-              -H "Content-Type: application/json" \
-              -H "Accept: text/event-stream, application/json" \
-              -d "$REQUEST_BODY"
-          ) 2> "$CURL_ERR_FILE" | while IFS= read -r line; do
+          # IMPORTANT: use process substitution (< <(...)) so the while loop runs in the current shell
+          while IFS= read -r line; do
             LINE_NO=$((LINE_NO+1))
             TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-            # Normalize line for logging
-            LOG_LINE="$TIMESTAMP | line:$LINE_NO | raw: $line"
 
-            # Save raw line to file for later inspection
+            # Save raw line for later inspection
             printf '%s\n' "$line" >> "$RAW_STREAM_FILE"
 
-            # Print a short log for each line (keeps logs readable)
+            # Short log per line (keeps logs readable)
             echo "STREAM LINE $LINE_NO @ $TIMESTAMP"
-            # Try to pretty-print JSON if possible, otherwise print raw
             if printf '%s' "$line" | jq . >/dev/null 2>&1; then
               printf '%s\n' "$line" | jq . || true
             else
@@ -88,7 +79,9 @@ jobs:
 
             # Handle SSE "data:" prefix and ignore [DONE]
             if [[ $line == data:* ]]; then
-              JSON_DATA=${line:5}
+              # remove leading 'data:' and optional space
+              JSON_DATA="${line#data:}"
+              JSON_DATA="${JSON_DATA# }"
             else
               JSON_DATA="$line"
             fi
@@ -103,7 +96,6 @@ jobs:
             PART_ANALYSIS=$(printf '%s' "$JSON_DATA" | jq -r '.choices? // [] | .[] | .delta? // {} | .reasoning_content? // empty' 2>/dev/null || true)
             if [[ -n "$PART_ANALYSIS" ]]; then
               REASONING_COUNT=$((REASONING_COUNT+1))
-              # preserve separation between fragments
               if [[ -n "$ANALYSIS" ]]; then
                 ANALYSIS+=$'\n'"$PART_ANALYSIS"
               else
@@ -148,7 +140,14 @@ jobs:
               fi
               echo "STREAM: captured error fragment: $PART_ERROR"
             fi
-          done
+
+          done < <(
+            curl --no-buffer -s -N https://api.fireworks.ai/inference/v1/chat/completions \
+              -H "Authorization: Bearer $FIREWORKS_API_KEY" \
+              -H "Content-Type: application/json" \
+              -H "Accept: text/event-stream, application/json" \
+              -d "$REQUEST_BODY" 2> "$CURL_ERR_FILE"
+          )
 
           # After stream ends, show curl stderr if any
           if [ -s "$CURL_ERR_FILE" ]; then
@@ -157,7 +156,7 @@ jobs:
           fi
 
           echo "STREAM finished. Lines received: $LINE_NO, content fragments: $DELTA_COUNT, reasoning fragments: $REASONING_COUNT"
-          echo "Raw stream file path: $RAW_STREAM_FILE (first 2000 chars below)"
+          echo "Raw stream file preview (first 2000 chars):"
           head -c 2000 "$RAW_STREAM_FILE" || true
           echo
 
@@ -176,31 +175,30 @@ jobs:
             echo "WARN: response empty after parsing -> using fallback marker"
           fi
 
-          # Build minimal payload for webhook (request_id, status, response.text, user_id optional, analysis)
-          PAYLOAD=$(jq -n \
-            --arg request_id "$REQUEST_ID" \
+          # Build minimal payload for webhook: request_id, status, response.text, reasoning, error, user_id (empty if unknown)
+          MINIMAL_PAYLOAD=$(jq -n \
+            --arg rid "$REQUEST_ID" \
             --arg status "completed" \
-            --arg response "$RESPONSE" \
-            --arg analysis "$ANALYSIS" \
-            --arg error "$ERROR_MSG" \
+            --arg response_text "$RESPONSE" \
+            --arg reasoning_text "$ANALYSIS" \
+            --arg error_text "$ERROR_MSG" \
             --arg user_id "" \
-            '{request_id:$request_id, status:$status, response:{text:$response}, reasoning:$analysis, error:$error, user_id:$user_id}')
+            '{request_id: $rid, status: $status, response: { text: $response_text }, reasoning: $reasoning_text, error: $error_text, user_id: $user_id}')
 
           echo "Payload a enviar para webhook (preview):"
-          echo "$PAYLOAD" | jq .
+          echo "$MINIMAL_PAYLOAD" | jq .
 
           # Send to webhook (Make.com)
           if [ -n "${WEBHOOK_URL:-}" ]; then
             HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$WEBHOOK_URL" \
               -H "Content-Type: application/json" \
-              --data-binary "$PAYLOAD" || echo "000")
+              --data-binary "$MINIMAL_PAYLOAD" || echo "000")
             echo "Webhook notify -> HTTP $HTTP_STATUS"
           else
             echo "No WEBHOOK_URL provided; skipping notify."
           fi
 
-          # Keep raw stream file as artifact in logs for debugging (printed above)
-          # Clean up temp files except RAW_STREAM_FILE for inspection in logs (runner will remove workspace after)
-          rm -f "$CURL_ERR_FILE" || true
+          # Clean up temp files
+          rm -f "$RAW_STREAM_FILE" "$CURL_ERR_FILE" || true
 
           echo "Done processing request_id=$REQUEST_ID"
